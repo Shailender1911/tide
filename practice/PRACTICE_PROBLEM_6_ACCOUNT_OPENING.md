@@ -355,3 +355,313 @@ Think about:
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation</summary>
+
+### Fixed Account Opening Controller
+
+```java
+package com.bank.accounts;
+
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/v1/accounts")
+public class AccountOpeningController {
+
+    private static final Logger logger = LoggerFactory.getLogger(AccountOpeningController.class);
+    private static final Set<String> VALID_ACCOUNT_TYPES = Set.of("SAVINGS", "CURRENT", "BUSINESS");
+
+    // FIX: Configurable values instead of magic numbers
+    @Value("${account.referral.bonus:50.00}")
+    private BigDecimal referralBonus;
+
+    @Value("${account.referrer.bonus:25.00}")
+    private BigDecimal referrerBonus;
+
+    @Value("${account.opening.fee:10.00}")
+    private BigDecimal accountOpeningFee;
+
+    @Value("${account.upgrade.min-balance:10000}")
+    private BigDecimal upgradeMinBalance;
+
+    private final AccountRepository accountRepository;
+    private final CustomerRepository customerRepository;
+    private final PaymentGateway paymentGateway;
+    private final BonusService bonusService;
+    private final ReferralService referralService;  // FIX: Use database for referrals
+    private final AuditService auditService;
+
+    public AccountOpeningController(AccountRepository accountRepository,
+                                   CustomerRepository customerRepository,
+                                   PaymentGateway paymentGateway,
+                                   BonusService bonusService,
+                                   ReferralService referralService,
+                                   AuditService auditService) {
+        this.accountRepository = accountRepository;
+        this.customerRepository = customerRepository;
+        this.paymentGateway = paymentGateway;
+        this.bonusService = bonusService;
+        this.referralService = referralService;
+        this.auditService = auditService;
+    }
+
+    @PostMapping("/open")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<AccountResponse> openAccount(
+            @Valid @RequestBody AccountOpeningRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+        
+        logger.info("Account opening - customer: {}, type: {}", 
+                   request.getCustomerId(), request.getAccountType());
+
+        // FIX: Validate account type
+        if (!VALID_ACCOUNT_TYPES.contains(request.getAccountType())) {
+            throw new InvalidAccountTypeException(
+                "Invalid account type. Allowed: " + VALID_ACCOUNT_TYPES);
+        }
+
+        Customer customer = customerRepository.findById(request.getCustomerId())
+            .orElseThrow(() -> new CustomerNotFoundException(request.getCustomerId()));
+
+        // FIX: Authorize - customer can only open for themselves
+        if (!Objects.equals(customer.getUserId(), currentUserId)) {
+            throw new UnauthorizedException("Cannot open account for another customer");
+        }
+
+        // FIX: Use .equals() for string comparison
+        if (!"VERIFIED".equals(customer.getKycStatus())) {
+            throw new KycNotVerifiedException("KYC verification required before opening account");
+        }
+
+        // FIX: UUID for account ID
+        Account account = new Account();
+        account.setId(UUID.randomUUID().toString());
+        account.setCustomerId(request.getCustomerId());
+        account.setType(request.getAccountType());
+        account.setBalance(BigDecimal.ZERO);  // FIX: BigDecimal
+        account.setStatus("ACTIVE");
+        account.setCreatedAt(Instant.now());
+        account.setInterestRate(getInterestRateForType(request.getAccountType()));
+
+        // Process initial deposit if provided
+        if (request.getInitialDeposit() != null && 
+            request.getInitialDeposit().compareTo(BigDecimal.ZERO) > 0) {
+            
+            // FIX: Process payment FIRST
+            PaymentResult result = paymentGateway.charge(
+                request.getPaymentToken(),  // Token, not raw card details
+                request.getInitialDeposit()
+            );
+            
+            if (!result.isSuccess()) {
+                throw new PaymentFailedException("Initial deposit failed: " + result.getErrorMessage());
+            }
+            
+            account.setBalance(request.getInitialDeposit());
+        }
+
+        // Apply referral bonus (server-side validation)
+        if (request.getReferralCode() != null && !request.getReferralCode().isEmpty()) {
+            // FIX: Validate and track referrals in database
+            if (referralService.isValidAndNotExhausted(request.getReferralCode())) {
+                account.setBalance(account.getBalance().add(referralBonus));
+                bonusService.creditReferrer(request.getReferralCode(), referrerBonus);
+                referralService.recordUsage(request.getReferralCode());
+                
+                logger.info("Referral bonus applied - code: {}", request.getReferralCode());
+            }
+        }
+
+        // FIX: Fee waiver is server-side decision, not client parameter
+        if (!isEligibleForFeeWaiver(customer, request)) {
+            if (account.getBalance().compareTo(accountOpeningFee) < 0) {
+                throw new InsufficientBalanceException("Insufficient balance for account opening fee");
+            }
+            account.setBalance(account.getBalance().subtract(accountOpeningFee));
+        }
+
+        accountRepository.save(account);
+
+        auditService.log(AuditEntry.builder()
+            .action("ACCOUNT_OPENED")
+            .accountId(account.getId())
+            .customerId(request.getCustomerId())
+            .accountType(request.getAccountType())
+            .timestamp(Instant.now())
+            .build());
+
+        logger.info("Account opened - id: {}, customer: {}, type: {}", 
+                   account.getId(), request.getCustomerId(), request.getAccountType());
+
+        // FIX: Return proper response
+        return ResponseEntity.status(HttpStatus.CREATED).body(new AccountResponse(
+            account.getId(),
+            account.getType(),
+            account.getBalance(),
+            account.getInterestRate(),
+            account.getStatus(),
+            account.getCreatedAt()
+        ));
+    }
+
+    @PostMapping("/close/{accountId}")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<AccountClosureResponse> closeAccount(
+            @PathVariable String accountId,
+            @RequestBody AccountClosureRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        Account account = accountRepository.findById(accountId)
+            .orElseThrow(() -> new AccountNotFoundException(accountId));
+
+        Customer customer = customerRepository.findById(account.getCustomerId())
+            .orElseThrow(() -> new CustomerNotFoundException(account.getCustomerId()));
+
+        // FIX: Authorization check
+        if (!Objects.equals(customer.getUserId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized to close this account");
+        }
+
+        // FIX: Use BigDecimal.compareTo()
+        if (account.getBalance().compareTo(BigDecimal.ZERO) != 0) {
+            throw new AccountHasBalanceException(
+                "Account must have zero balance to close. Current: " + account.getBalance());
+        }
+
+        account.setStatus("CLOSED");
+        account.setClosedAt(Instant.now());
+        account.setClosureReason(request.getReason());
+        accountRepository.save(account);
+
+        auditService.log(AuditEntry.builder()
+            .action("ACCOUNT_CLOSED")
+            .accountId(accountId)
+            .closedBy(currentUserId)
+            .reason(request.getReason())
+            .timestamp(Instant.now())
+            .build());
+
+        logger.info("Account closed - id: {}, by: {}", accountId, currentUserId);
+
+        return ResponseEntity.ok(new AccountClosureResponse(
+            accountId,
+            "CLOSED",
+            Instant.now()
+        ));
+    }
+
+    @PutMapping("/upgrade/{accountId}")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<AccountResponse> upgradeAccount(
+            @PathVariable String accountId,
+            @Valid @RequestBody AccountUpgradeRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        Account account = accountRepository.findById(accountId)
+            .orElseThrow(() -> new AccountNotFoundException(accountId));
+
+        Customer customer = customerRepository.findById(account.getCustomerId())
+            .orElseThrow(() -> new CustomerNotFoundException(account.getCustomerId()));
+
+        // FIX: Authorization
+        if (!Objects.equals(customer.getUserId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized to upgrade this account");
+        }
+
+        // FIX: Server-side eligibility check (no client bypass)
+        if (account.getBalance().compareTo(upgradeMinBalance) < 0) {
+            throw new NotEligibleForUpgradeException(
+                "Minimum balance of " + upgradeMinBalance + " required for upgrade");
+        }
+
+        if (!VALID_ACCOUNT_TYPES.contains(request.getNewType())) {
+            throw new InvalidAccountTypeException("Invalid account type");
+        }
+
+        String previousType = account.getType();
+        account.setType(request.getNewType());
+        account.setInterestRate(getInterestRateForType(request.getNewType()));
+        account.setUpgradedAt(Instant.now());
+        accountRepository.save(account);
+
+        auditService.log(AuditEntry.builder()
+            .action("ACCOUNT_UPGRADED")
+            .accountId(accountId)
+            .previousType(previousType)
+            .newType(request.getNewType())
+            .upgradedBy(currentUserId)
+            .timestamp(Instant.now())
+            .build());
+
+        logger.info("Account upgraded - id: {}, from: {} to: {}", 
+                   accountId, previousType, request.getNewType());
+
+        return ResponseEntity.ok(new AccountResponse(
+            account.getId(),
+            account.getType(),
+            account.getBalance(),
+            account.getInterestRate(),
+            account.getStatus(),
+            account.getCreatedAt()
+        ));
+    }
+
+    // FIX: Private helper, not exposed as endpoint
+    private BigDecimal getInterestRateForType(String accountType) {
+        return switch (accountType) {
+            case "SAVINGS" -> new BigDecimal("0.04");
+            case "CURRENT" -> new BigDecimal("0.01");
+            case "BUSINESS" -> new BigDecimal("0.025");
+            default -> new BigDecimal("0.02");
+        };
+    }
+
+    private boolean isEligibleForFeeWaiver(Customer customer, AccountOpeningRequest request) {
+        // Server-side logic for fee waiver eligibility
+        return customer.isPremium() || 
+               (request.getInitialDeposit() != null && 
+                request.getInitialDeposit().compareTo(new BigDecimal("1000")) >= 0);
+    }
+}
+```
+
+### Key Fixes Summary
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| `waiveFees` | Client parameter | Server-side eligibility check |
+| `forceClose` | Client parameter | Removed, require zero balance |
+| `skipEligibility` | Client parameter | Server-side only |
+| Card details | In URL params | Payment token only |
+| Money type | `double` | `BigDecimal` |
+| Account ID | `System.currentTimeMillis()` | `UUID` |
+| KYC check | `!=` | `.equals()` |
+| Referral tracking | Static HashMap | Database service |
+| Response | `void` | `ResponseEntity<AccountResponse>` |
+| Magic numbers | Hardcoded | `@Value` configuration |
+| Authorization | None | Check customer.userId == currentUser |
+
+</details>
+

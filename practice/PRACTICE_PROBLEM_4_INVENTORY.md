@@ -266,3 +266,313 @@ public class InventoryController {
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation</summary>
+
+### Fixed Inventory Controller
+
+```java
+package com.warehouse.inventory;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.UUID;
+
+/**
+ * Inventory controller for warehouse management.
+ * Uses database for reservation tracking (not in-memory).
+ */
+@RestController
+@RequestMapping("/api/v1/inventory")
+public class InventoryController {
+
+    private static final Logger logger = LoggerFactory.getLogger(InventoryController.class);
+    private static final Duration RESERVATION_EXPIRY = Duration.ofMinutes(15);
+
+    // FIX: Constructor injection
+    private final ProductRepository productRepository;
+    private final ReservationRepository reservationRepository;
+    private final ReservationService reservationService;
+
+    public InventoryController(ProductRepository productRepository,
+                               ReservationRepository reservationRepository,
+                               ReservationService reservationService) {
+        this.productRepository = productRepository;
+        this.reservationRepository = reservationRepository;
+        this.reservationService = reservationService;
+    }
+
+    /**
+     * Reserve stock for an order.
+     */
+    @PostMapping("/reserve/{productId}")
+    @Transactional(rollbackFor = Exception.class)  // FIX: Atomic reservation
+    public ResponseEntity<ReservationResponse> reserveStock(
+            @PathVariable String productId,
+            @Valid @RequestBody ReservationRequest request) {
+
+        logger.info("Reserve request - product: {}, quantity: {}, order: {}", 
+                   productId, request.getQuantity(), request.getOrderId());
+
+        // FIX: Proper null handling with custom exception
+        Product product = productRepository.findById(productId)
+            .orElseThrow(() -> new ProductNotFoundException(productId));
+
+        // FIX: Calculate reserved from DATABASE (not in-memory)
+        int totalReserved = reservationRepository.sumActiveReservationsByProductId(productId);
+        int available = product.getStockQuantity() - totalReserved;
+
+        // FIX: Use >= for comparison
+        if (available < request.getQuantity()) {
+            logger.warn("Insufficient stock - product: {}, available: {}, requested: {}", 
+                       productId, available, request.getQuantity());
+            throw new InsufficientStockException(
+                String.format("Not enough stock. Available: %d, Requested: %d", 
+                             available, request.getQuantity()));
+        }
+
+        // FIX: UUID for reservation ID
+        Reservation reservation = new Reservation();
+        reservation.setId(UUID.randomUUID().toString());
+        reservation.setProductId(productId);
+        reservation.setOrderId(request.getOrderId());
+        reservation.setQuantity(request.getQuantity());
+        reservation.setCreatedAt(Instant.now());
+        reservation.setExpiresAt(Instant.now().plus(RESERVATION_EXPIRY));  // FIX: Use Duration
+        reservation.setStatus("ACTIVE");
+
+        reservationRepository.save(reservation);
+
+        logger.info("Reservation created - id: {}, product: {}, quantity: {}", 
+                   reservation.getId(), productId, request.getQuantity());
+
+        // FIX: Return proper response
+        ReservationResponse response = new ReservationResponse(
+            reservation.getId(),
+            productId,
+            request.getQuantity(),
+            reservation.getExpiresAt(),
+            "RESERVED"
+        );
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
+    /**
+     * Cancel a reservation.
+     */
+    @DeleteMapping("/reserve/{reservationId}")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<Void> cancelReservation(@PathVariable String reservationId) {
+
+        logger.info("Cancel reservation request - id: {}", reservationId);
+
+        Reservation reservation = reservationRepository.findById(reservationId)
+            .orElseThrow(() -> new ReservationNotFoundException(reservationId));
+
+        // FIX: Just update status in database (no in-memory map to update)
+        reservation.setStatus("CANCELLED");
+        reservation.setCancelledAt(Instant.now());
+        reservationRepository.save(reservation);
+
+        logger.info("Reservation cancelled - id: {}, product: {}", 
+                   reservationId, reservation.getProductId());
+
+        return ResponseEntity.noContent().build();
+    }
+
+    /**
+     * Adjust stock (manager only).
+     */
+    @PutMapping("/adjust")
+    @PreAuthorize("hasRole('MANAGER')")  // FIX: Server-side role check
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<StockAdjustmentResponse> adjustStock(
+            @Valid @RequestBody StockAdjustmentRequest request) {
+
+        String currentUser = SecurityContext.getCurrentUserId();
+        
+        logger.info("Stock adjustment - product: {}, adjustment: {}, user: {}, reason: {}", 
+                   request.getProductId(), request.getAdjustment(), currentUser, request.getReason());
+
+        Product product = productRepository.findById(request.getProductId())
+            .orElseThrow(() -> new ProductNotFoundException(request.getProductId()));
+
+        int oldQuantity = product.getStockQuantity();
+        int newQuantity = oldQuantity + request.getAdjustment();
+
+        // FIX: Validate stock doesn't go negative
+        if (newQuantity < 0) {
+            throw new InvalidStockAdjustmentException(
+                String.format("Adjustment would result in negative stock. Current: %d, Adjustment: %d", 
+                             oldQuantity, request.getAdjustment()));
+        }
+
+        product.setStockQuantity(newQuantity);
+        productRepository.save(product);
+
+        // FIX: Detailed audit logging
+        logger.info("Stock adjusted - product: {}, old: {}, new: {}, adjustedBy: {}, reason: {}", 
+                   request.getProductId(), oldQuantity, newQuantity, currentUser, request.getReason());
+
+        return ResponseEntity.ok(new StockAdjustmentResponse(
+            request.getProductId(),
+            oldQuantity,
+            newQuantity,
+            currentUser,
+            Instant.now()
+        ));
+    }
+
+    /**
+     * Check product availability.
+     */
+    @GetMapping("/check/{productId}")
+    public ResponseEntity<AvailabilityResponse> checkAvailability(@PathVariable String productId) {
+
+        Product product = productRepository.findById(productId)
+            .orElseThrow(() -> new ProductNotFoundException(productId));
+
+        // FIX: Calculate from database
+        int totalReserved = reservationRepository.sumActiveReservationsByProductId(productId);
+        int available = product.getStockQuantity() - totalReserved;
+
+        return ResponseEntity.ok(new AvailabilityResponse(
+            productId,
+            product.getStockQuantity(),
+            totalReserved,
+            available
+        ));
+    }
+
+    /**
+     * Bulk reserve with atomic transaction.
+     */
+    @PostMapping("/bulk-reserve")
+    @Transactional(rollbackFor = Exception.class)  // FIX: All or nothing
+    public ResponseEntity<BulkReservationResponse> bulkReserve(
+            @Valid @RequestBody List<ReservationRequest> requests) {
+
+        List<ReservationResponse> results = new ArrayList<>();
+
+        // FIX: Validate ALL first
+        for (ReservationRequest req : requests) {
+            Product product = productRepository.findById(req.getProductId())
+                .orElseThrow(() -> new ProductNotFoundException(req.getProductId()));
+            
+            int available = product.getStockQuantity() - 
+                reservationRepository.sumActiveReservationsByProductId(req.getProductId());
+            
+            if (available < req.getQuantity()) {
+                throw new InsufficientStockException(
+                    "Not enough stock for product: " + req.getProductId());
+            }
+        }
+
+        // Process all (will all succeed or all fail due to @Transactional)
+        for (ReservationRequest req : requests) {
+            Reservation reservation = createReservation(req);
+            results.add(new ReservationResponse(
+                reservation.getId(),
+                req.getProductId(),
+                req.getQuantity(),
+                reservation.getExpiresAt(),
+                "RESERVED"
+            ));
+        }
+
+        return ResponseEntity.status(HttpStatus.CREATED)
+            .body(new BulkReservationResponse(results, "ALL_RESERVED"));
+    }
+
+    private Reservation createReservation(ReservationRequest request) {
+        Reservation reservation = new Reservation();
+        reservation.setId(UUID.randomUUID().toString());
+        reservation.setProductId(request.getProductId());
+        reservation.setOrderId(request.getOrderId());
+        reservation.setQuantity(request.getQuantity());
+        reservation.setCreatedAt(Instant.now());
+        reservation.setExpiresAt(Instant.now().plus(RESERVATION_EXPIRY));
+        reservation.setStatus("ACTIVE");
+        return reservationRepository.save(reservation);
+    }
+}
+```
+
+### Repository with Reservation Sum Query
+
+```java
+public interface ReservationRepository extends JpaRepository<Reservation, String> {
+    
+    @Query("SELECT COALESCE(SUM(r.quantity), 0) FROM Reservation r " +
+           "WHERE r.productId = :productId " +
+           "AND r.status = 'ACTIVE' " +
+           "AND r.expiresAt > CURRENT_TIMESTAMP")
+    int sumActiveReservationsByProductId(@Param("productId") String productId);
+}
+```
+
+### DTOs
+
+```java
+public class ReservationRequest {
+    @NotBlank
+    private String orderId;
+
+    @NotBlank
+    private String productId;
+
+    @Min(value = 1, message = "Quantity must be at least 1")
+    private int quantity;
+}
+
+public record ReservationResponse(
+    String reservationId,
+    String productId,
+    int quantity,
+    Instant expiresAt,
+    String status
+) {}
+
+public class StockAdjustmentRequest {
+    @NotBlank
+    private String productId;
+
+    private int adjustment;  // Can be positive or negative
+
+    @NotBlank
+    private String reason;
+}
+```
+
+### Key Fixes Summary
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| Reservation tracking | Static HashMap | Database query |
+| Thread safety | HashMap | Database + @Transactional |
+| Manager check | `isManager` from client | `@PreAuthorize("hasRole('MANAGER')")` |
+| Quantity comparison | `>` | `<` (checking if not enough) |
+| Stock negative | No check | Validate newQuantity >= 0 |
+| Bulk atomicity | For loop, partial success | @Transactional, all or nothing |
+| Reservation ID | orderId + productId | UUID |
+| Response | void | ResponseEntity with details |
+| Expiry | Magic number | Duration.ofMinutes(15) |
+
+</details>
+

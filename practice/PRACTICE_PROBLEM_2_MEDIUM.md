@@ -272,3 +272,281 @@ Think about:
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation</summary>
+
+### Fixed Payment Controller
+
+```java
+package com.ecommerce.payments;
+
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.Objects;
+import java.util.UUID;
+
+/**
+ * Payment controller for processing orders.
+ * Handles payment processing, refunds, and webhook callbacks.
+ */
+@RestController
+@RequestMapping("/api/v1/payments")  // FIX: No trailing slash
+public class PaymentController {
+
+    private static final Logger logger = LoggerFactory.getLogger(PaymentController.class);
+
+    // FIX: Constructor injection with private final
+    private final OrderService orderService;
+    private final PaymentGateway paymentGateway;
+    private final NotificationService notificationService;
+
+    public PaymentController(OrderService orderService,
+                            PaymentGateway paymentGateway,
+                            NotificationService notificationService) {
+        this.orderService = orderService;
+        this.paymentGateway = paymentGateway;
+        this.notificationService = notificationService;
+    }
+
+    /**
+     * Process payment for an order.
+     */
+    @PostMapping("/process/{orderId}")  // FIX: POST for processing payment
+    @Transactional(rollbackFor = Exception.class)  // FIX: Atomic operation
+    public ResponseEntity<PaymentResponse> processPayment(
+            @PathVariable String orderId,
+            @RequestHeader(value = "X-Idempotency-Key", required = false) String idempotencyKey,
+            @Valid @RequestBody PaymentRequest request) {  // FIX: Card details in body, not URL
+
+        logger.info("Processing payment for orderId: {}, idempotencyKey: {}", orderId, idempotencyKey);
+
+        // FIX: Null check with proper exception
+        Order order = orderService.getOrder(orderId);
+        if (order == null) {
+            throw new OrderNotFoundException(orderId);
+        }
+
+        // FIX: Use BigDecimal.compareTo() for money comparison
+        if (request.getAmount().compareTo(order.getAmount()) != 0) {
+            logger.warn("Amount mismatch for order: {}", orderId);
+            throw new PaymentAmountMismatchException(
+                "Expected: " + order.getAmount() + ", Received: " + request.getAmount());
+        }
+
+        // FIX: Use tokenized payment (card details never reach your server)
+        PaymentResult result = paymentGateway.charge(
+            request.getPaymentToken(),  // Token from payment provider
+            request.getAmount()
+        );
+
+        if (!result.isSuccess()) {
+            logger.warn("Payment failed for order: {}, reason: {}", orderId, result.getErrorMessage());
+            throw new PaymentFailedException(result.getErrorMessage());
+        }
+
+        // FIX: UUID for payment ID
+        String paymentId = UUID.randomUUID().toString();
+
+        order.setStatus("PAID");
+        order.setPaymentId(paymentId);
+        order.setPaidAt(Instant.now());
+        orderService.save(order);
+
+        notificationService.sendReceipt(order.getCustomerEmail(), request.getAmount());
+
+        logger.info("Payment successful - orderId: {}, paymentId: {}", orderId, paymentId);
+
+        // FIX: Return proper response
+        PaymentResponse response = PaymentResponse.builder()
+            .paymentId(paymentId)
+            .orderId(orderId)
+            .amount(request.getAmount())
+            .status("SUCCESS")
+            .timestamp(Instant.now())
+            .build();
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
+    /**
+     * Refund a payment.
+     */
+    @PostMapping("/refund/{orderId}")  // FIX: POST for state-changing operation
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<RefundResponse> refundPayment(
+            @PathVariable String orderId,
+            @Valid @RequestBody RefundRequest request) {
+
+        String currentUserId = AuthContext.getCurrentUserId();
+        logger.info("Refund request for order: {} by user: {}", orderId, currentUserId);
+
+        Order order = orderService.getOrder(orderId);
+        if (order == null) {
+            throw new OrderNotFoundException(orderId);
+        }
+
+        // FIX: Server-side authorization check
+        if (!Objects.equals(order.getCustomerId(), currentUserId)) {
+            logger.warn("Unauthorized refund attempt by: {} for order: {}", currentUserId, orderId);
+            throw new UnauthorizedException("Not authorized to refund this order");
+        }
+
+        // FIX: Use BigDecimal.compareTo() with <= check
+        if (request.getRefundAmount().compareTo(order.getAmount()) > 0) {
+            throw new InvalidRefundException("Refund amount exceeds order amount");
+        }
+
+        // Check if already refunded
+        if ("REFUNDED".equals(order.getStatus())) {
+            throw new InvalidRefundException("Order already refunded");
+        }
+
+        // FIX: Refund FIRST, then update status
+        paymentGateway.refund(order.getPaymentId(), request.getRefundAmount());
+
+        order.setStatus("REFUNDED");
+        order.setRefundAmount(request.getRefundAmount());
+        order.setRefundedAt(Instant.now());
+        orderService.save(order);
+
+        notificationService.sendRefundConfirmation(order.getCustomerEmail());
+
+        logger.info("Refund successful - orderId: {}, amount: {}", orderId, request.getRefundAmount());
+
+        RefundResponse response = new RefundResponse(
+            orderId,
+            request.getRefundAmount(),
+            "REFUNDED",
+            Instant.now()
+        );
+
+        return ResponseEntity.ok(response);
+    }
+
+    /**
+     * Handle payment webhook from payment provider.
+     */
+    @PostMapping("/webhook/payment-status")
+    public ResponseEntity<Void> handleWebhook(
+            @RequestHeader("X-Webhook-Signature") String signature,  // FIX: Verify signature
+            @RequestBody String payload) {
+
+        // FIX: Verify webhook signature from payment provider
+        if (!paymentGateway.verifyWebhookSignature(payload, signature)) {
+            logger.warn("Invalid webhook signature");
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+
+        WebhookPayload webhook = parseWebhook(payload);
+        
+        // FIX: Validate status against allowed values
+        if (!isValidStatus(webhook.getStatus())) {
+            logger.warn("Invalid status in webhook: {}", webhook.getStatus());
+            return ResponseEntity.badRequest().build();
+        }
+
+        Order order = orderService.getOrder(webhook.getOrderId());
+        if (order != null) {
+            order.setStatus(webhook.getStatus());
+            orderService.save(order);
+            logger.info("Order status updated via webhook: {}", webhook.getOrderId());
+        }
+
+        return ResponseEntity.ok().build();
+    }
+
+    private boolean isValidStatus(String status) {
+        return Set.of("PENDING", "PAID", "FAILED", "REFUNDED").contains(status);
+    }
+}
+```
+
+### DTOs
+
+```java
+// Payment Request - NEVER includes raw card details
+public class PaymentRequest {
+    @NotBlank
+    private String paymentToken;  // Token from Stripe/PayPal frontend
+
+    @NotNull
+    @DecimalMin("0.01")
+    private BigDecimal amount;  // FIX: BigDecimal for money
+}
+
+// Refund Request
+public class RefundRequest {
+    @NotNull
+    @DecimalMin("0.01")
+    private BigDecimal refundAmount;
+
+    private String reason;
+}
+
+// Payment Response
+@Builder
+public class PaymentResponse {
+    private String paymentId;
+    private String orderId;
+    private BigDecimal amount;
+    private String status;
+    private Instant timestamp;
+}
+
+// Refund Response
+public record RefundResponse(
+    String orderId,
+    BigDecimal refundAmount,
+    String status,
+    Instant refundedAt
+) {}
+```
+
+### Custom Exceptions
+
+```java
+@ResponseStatus(HttpStatus.NOT_FOUND)
+public class OrderNotFoundException extends RuntimeException { }
+
+@ResponseStatus(HttpStatus.BAD_REQUEST)  // 400
+public class PaymentAmountMismatchException extends RuntimeException { }
+
+@ResponseStatus(HttpStatus.PAYMENT_REQUIRED)  // 402
+public class PaymentFailedException extends RuntimeException { }
+
+@ResponseStatus(HttpStatus.BAD_REQUEST)
+public class InvalidRefundException extends RuntimeException { }
+
+@ResponseStatus(HttpStatus.FORBIDDEN)  // 403
+public class UnauthorizedException extends RuntimeException { }
+```
+
+### Key Fixes Summary
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| Card details | In URL params | Tokenized payment, body only |
+| Admin override | `isAdminOverride` from client | Server-side role check |
+| Money type | `double` | `BigDecimal` |
+| Transaction | Missing | `@Transactional` |
+| Refund order | Status first, then refund | Refund first, then status |
+| Webhook security | No verification | Signature verification |
+| Response | `void` | `ResponseEntity<T>` |
+| HTTP methods | PUT/GET | POST for both |
+| Authorization | Client-controlled | Server-side check |
+
+</details>
+

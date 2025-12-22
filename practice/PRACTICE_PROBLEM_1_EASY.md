@@ -214,3 +214,224 @@ Think about:
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation</summary>
+
+### Fixed Controller
+
+```java
+package com.app.users;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.Instant;
+import java.util.UUID;
+
+/**
+ * User registration and authentication controller.
+ */
+@RestController
+@RequestMapping("/api/v1/users")  // FIX: Added API versioning
+public class UserController {
+
+    private static final Logger logger = LoggerFactory.getLogger(UserController.class);
+
+    // FIX: Constructor injection with private final fields
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+    private final EmailService emailService;
+
+    public UserController(UserRepository userRepository,
+                          PasswordEncoder passwordEncoder,
+                          EmailService emailService) {
+        this.userRepository = userRepository;
+        this.passwordEncoder = passwordEncoder;
+        this.emailService = emailService;
+    }
+
+    /**
+     * Register a new user.
+     */
+    @PostMapping("/register")  // FIX: POST for creating resources
+    @Transactional  // FIX: Ensure atomicity of save + email
+    public ResponseEntity<UserResponse> registerUser(
+            @Valid @RequestBody RegistrationRequest request) {  // FIX: Request body with validation
+
+        logger.info("Registration attempt for email: {}", request.getEmail());
+
+        // Check if user already exists
+        if (userRepository.existsByEmail(request.getEmail())) {
+            logger.warn("Registration failed - email already exists: {}", request.getEmail());
+            throw new UserAlreadyExistsException(request.getEmail());  // FIX: Proper exception (409)
+        }
+
+        // Create user
+        User user = new User();
+        user.setId(UUID.randomUUID().toString());  // FIX: UUID instead of Random
+        user.setEmail(request.getEmail());
+        user.setPassword(passwordEncoder.encode(request.getPassword()));  // FIX: Encrypt password!
+        user.setName(request.getName());
+        user.setCreatedAt(Instant.now());  // FIX: Use Instant
+
+        userRepository.save(user);
+
+        // Send welcome email
+        emailService.sendEmail(request.getEmail(), "Welcome!", "Thanks for registering");
+
+        // FIX: Use logger, NEVER log passwords
+        logger.info("User registered successfully: userId={}", user.getId());
+
+        // FIX: Return response DTO (not entity)
+        UserResponse response = new UserResponse(
+            user.getId(),
+            user.getEmail(),
+            user.getName(),
+            user.getCreatedAt()
+        );
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
+    /**
+     * Authenticate a user.
+     */
+    @PostMapping("/login")  // FIX: POST for login (sends credentials)
+    public ResponseEntity<LoginResponse> login(
+            @Valid @RequestBody LoginRequest request) {
+
+        logger.info("Login attempt for email: {}", request.getEmail());
+
+        User user = userRepository.findByEmail(request.getEmail());
+        
+        // FIX: Null check before accessing user
+        if (user == null) {
+            logger.warn("Login failed - user not found: {}", request.getEmail());
+            throw new UnauthorizedException("Invalid credentials");  // FIX: 401, not 500
+        }
+
+        // FIX: Use passwordEncoder.matches() for secure comparison
+        if (!passwordEncoder.matches(request.getPassword(), user.getPassword())) {
+            logger.warn("Login failed - invalid password for: {}", request.getEmail());
+            throw new UnauthorizedException("Invalid credentials");
+        }
+
+        logger.info("Login successful for userId: {}", user.getId());
+
+        // FIX: Return DTO without sensitive data
+        LoginResponse response = new LoginResponse(
+            user.getId(),
+            user.getEmail(),
+            user.getName(),
+            generateToken(user)  // JWT or session token
+        );
+
+        return ResponseEntity.ok(response);
+    }
+
+    private String generateToken(User user) {
+        // JWT generation logic
+        return "jwt-token-here";
+    }
+}
+```
+
+### Request/Response DTOs
+
+```java
+// Registration Request with validation
+public class RegistrationRequest {
+    
+    @NotBlank(message = "Email is required")
+    @Email(message = "Invalid email format")
+    private String email;
+
+    @NotBlank(message = "Password is required")
+    @Size(min = 8, message = "Password must be at least 8 characters")
+    private String password;
+
+    @NotBlank(message = "Name is required")
+    @Size(min = 2, max = 100)
+    private String name;
+
+    // Getters and setters
+}
+
+// Login Request
+public class LoginRequest {
+    
+    @NotBlank(message = "Email is required")
+    @Email
+    private String email;
+
+    @NotBlank(message = "Password is required")
+    private String password;
+
+    // Getters and setters
+}
+
+// User Response (no password!)
+public record UserResponse(
+    String id,
+    String email,
+    String name,
+    Instant createdAt
+) {}
+
+// Login Response
+public record LoginResponse(
+    String id,
+    String email,
+    String name,
+    String token
+) {}
+```
+
+### Custom Exceptions
+
+```java
+@ResponseStatus(HttpStatus.CONFLICT)  // 409
+public class UserAlreadyExistsException extends RuntimeException {
+    public UserAlreadyExistsException(String email) {
+        super("User already exists with email: " + email);
+    }
+}
+
+@ResponseStatus(HttpStatus.UNAUTHORIZED)  // 401
+public class UnauthorizedException extends RuntimeException {
+    public UnauthorizedException(String message) {
+        super(message);
+    }
+}
+```
+
+### Key Fixes Summary
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| Password storage | Plain text | `passwordEncoder.encode()` |
+| Password comparison | `==` | `passwordEncoder.matches()` |
+| Password in logs | `System.out.println(password)` | Never log passwords |
+| HTTP method | `@GetMapping` | `@PostMapping` |
+| Response | `void` | `ResponseEntity<UserResponse>` |
+| ID generation | `Random().nextInt(10000)` | `UUID.randomUUID()` |
+| User returned | Entity with password | DTO without password |
+| Null check | Missing | Check before access |
+| Error codes | 500 for everything | 401, 409 appropriately |
+| Dependency injection | Field injection, public | Constructor, private final |
+
+</details>
+

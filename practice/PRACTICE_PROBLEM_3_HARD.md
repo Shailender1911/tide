@@ -351,3 +351,407 @@ Think about:
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation (MOST IMPORTANT - similar to Tide!)</summary>
+
+### Fixed Transfer Controller
+
+```java
+package com.bank.transfers;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.NotBlank;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.Objects;
+import java.util.UUID;
+
+/**
+ * Transfer API for money transfers between accounts.
+ * 
+ * CRITICAL: All money operations are atomic via @Transactional.
+ * Uses BigDecimal for precision and proper authorization checks.
+ */
+@RestController
+@RequestMapping("/api/v2/transfers")
+public class TransferController {
+
+    private static final Logger logger = LoggerFactory.getLogger(TransferController.class);
+
+    // FIX: Constructor injection with private final
+    private final AccountRepository accountRepository;
+    private final TransferService transferService;
+    private final AuditService auditService;
+    private final FraudDetectionService fraudService;
+
+    public TransferController(AccountRepository accountRepository,
+                             TransferService transferService,
+                             AuditService auditService,
+                             FraudDetectionService fraudService) {
+        this.accountRepository = accountRepository;
+        this.transferService = transferService;
+        this.auditService = auditService;
+        this.fraudService = fraudService;
+    }
+
+    /**
+     * Transfer money between accounts.
+     */
+    @PostMapping("/send")  // FIX: POST for creating transfer
+    @Transactional(rollbackFor = Exception.class)  // FIX: CRITICAL - Atomic operation
+    public ResponseEntity<TransferResponse> sendMoney(
+            @RequestHeader(value = "X-Idempotency-Key", required = false) String idempotencyKey,
+            @Valid @RequestBody TransferRequest request) {
+
+        String currentUserId = SecurityContext.getUserId();
+        
+        logger.info("Transfer request - from: {}, to: {}, amount: {}, user: {}, idempotencyKey: {}", 
+                   request.getFromAccount(), request.getToAccount(), 
+                   request.getAmount(), currentUserId, idempotencyKey);
+
+        // FIX: Validate accounts exist with proper error handling
+        Account fromAccount = accountRepository.findById(request.getFromAccount())
+            .orElseThrow(() -> new AccountNotFoundException(request.getFromAccount()));
+        
+        Account toAccount = accountRepository.findById(request.getToAccount())
+            .orElseThrow(() -> new AccountNotFoundException(request.getToAccount()));
+
+        // FIX: Server-side authorization check (NOT from client!)
+        if (!Objects.equals(fromAccount.getOwnerId(), currentUserId)) {
+            logger.warn("Unauthorized transfer attempt - user: {}, account: {}", 
+                       currentUserId, request.getFromAccount());
+            throw new UnauthorizedException("Not authorized to transfer from this account");
+        }
+
+        // FIX: Fraud check (no bypass from client)
+        if (fraudService.isSuspicious(request.getFromAccount(), request.getAmount())) {
+            logger.warn("Suspicious transfer blocked - account: {}, amount: {}", 
+                       request.getFromAccount(), request.getAmount());
+            throw new FraudDetectedException("Transfer flagged for review");
+        }
+
+        // FIX: Use BigDecimal.compareTo() for balance check (>= not just >)
+        BigDecimal fromBalance = fromAccount.getBalance();
+        if (fromBalance.compareTo(request.getAmount()) < 0) {
+            logger.warn("Insufficient balance - account: {}, balance: {}, requested: {}", 
+                       request.getFromAccount(), fromBalance, request.getAmount());
+            throw new InsufficientBalanceException(
+                "Insufficient balance. Available: " + fromBalance);
+        }
+
+        // Generate unique transfer ID
+        String transferId = UUID.randomUUID().toString();
+
+        // Perform atomic transfer
+        fromAccount.setBalance(fromBalance.subtract(request.getAmount()));
+        toAccount.setBalance(toAccount.getBalance().add(request.getAmount()));
+
+        accountRepository.save(fromAccount);
+        accountRepository.save(toAccount);
+
+        // Create transfer record (same transaction)
+        Transfer transfer = new Transfer();
+        transfer.setId(transferId);
+        transfer.setFromAccount(request.getFromAccount());
+        transfer.setToAccount(request.getToAccount());
+        transfer.setAmount(request.getAmount());
+        transfer.setDescription(request.getDescription());
+        transfer.setStatus("COMPLETED");
+        transfer.setCreatedAt(Instant.now());
+        transfer.setCreatedBy(currentUserId);
+        transferService.save(transfer);
+
+        // FIX: Detailed audit logging
+        auditService.log(AuditEntry.builder()
+            .action("TRANSFER")
+            .transferId(transferId)
+            .fromAccount(request.getFromAccount())
+            .toAccount(request.getToAccount())
+            .amount(request.getAmount())
+            .userId(currentUserId)
+            .timestamp(Instant.now())
+            .build());
+
+        logger.info("Transfer successful - transferId: {}, from: {}, to: {}, amount: {}", 
+                   transferId, request.getFromAccount(), request.getToAccount(), request.getAmount());
+
+        // FIX: Return proper response
+        TransferResponse response = TransferResponse.builder()
+            .transferId(transferId)
+            .fromAccount(request.getFromAccount())
+            .toAccount(request.getToAccount())
+            .amount(request.getAmount())
+            .status("COMPLETED")
+            .timestamp(Instant.now())
+            .build();
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
+    /**
+     * Admin endpoint for staff-assisted transfers.
+     * ONLY accessible by users with STAFF role.
+     */
+    @PostMapping("/admin/send")
+    @PreAuthorize("hasRole('STAFF')")  // FIX: Server-side role check!
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<TransferResponse> staffTransfer(
+            @Valid @RequestBody TransferRequest request) {
+
+        String staffUserId = SecurityContext.getUserId();
+        
+        logger.info("Staff transfer - staff: {}, from: {}, to: {}, amount: {}", 
+                   staffUserId, request.getFromAccount(), request.getToAccount(), request.getAmount());
+
+        // Validate accounts
+        Account fromAccount = accountRepository.findById(request.getFromAccount())
+            .orElseThrow(() -> new AccountNotFoundException(request.getFromAccount()));
+        
+        Account toAccount = accountRepository.findById(request.getToAccount())
+            .orElseThrow(() -> new AccountNotFoundException(request.getToAccount()));
+
+        // Staff can skip ownership check but NOT fraud check
+        if (fraudService.isSuspicious(request.getFromAccount(), request.getAmount())) {
+            throw new FraudDetectedException("Transfer requires manager approval");
+        }
+
+        BigDecimal fromBalance = fromAccount.getBalance();
+        if (fromBalance.compareTo(request.getAmount()) < 0) {
+            throw new InsufficientBalanceException("Insufficient balance");
+        }
+
+        String transferId = UUID.randomUUID().toString();
+
+        fromAccount.setBalance(fromBalance.subtract(request.getAmount()));
+        toAccount.setBalance(toAccount.getBalance().add(request.getAmount()));
+
+        accountRepository.save(fromAccount);
+        accountRepository.save(toAccount);
+
+        Transfer transfer = new Transfer();
+        transfer.setId(transferId);
+        transfer.setFromAccount(request.getFromAccount());
+        transfer.setToAccount(request.getToAccount());
+        transfer.setAmount(request.getAmount());
+        transfer.setStatus("COMPLETED");
+        transfer.setCreatedAt(Instant.now());
+        transfer.setCreatedBy(staffUserId);
+        transfer.setStaffAssisted(true);  // Mark as staff-assisted
+        transferService.save(transfer);
+
+        // Enhanced audit for staff actions
+        auditService.log(AuditEntry.builder()
+            .action("STAFF_TRANSFER")
+            .transferId(transferId)
+            .staffId(staffUserId)
+            .fromAccount(request.getFromAccount())
+            .toAccount(request.getToAccount())
+            .amount(request.getAmount())
+            .timestamp(Instant.now())
+            .build());
+
+        logger.info("Staff transfer successful - transferId: {}, staff: {}", transferId, staffUserId);
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(
+            TransferResponse.builder()
+                .transferId(transferId)
+                .status("COMPLETED")
+                .timestamp(Instant.now())
+                .build()
+        );
+    }
+
+    /**
+     * Get account balance.
+     */
+    @GetMapping("/balance/{accountId}")
+    public ResponseEntity<BalanceResponse> getBalance(@PathVariable String accountId) {
+        String currentUserId = SecurityContext.getUserId();
+
+        Account account = accountRepository.findById(accountId)
+            .orElseThrow(() -> new AccountNotFoundException(accountId));
+
+        // FIX: Authorization check
+        if (!Objects.equals(account.getOwnerId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized to view this account");
+        }
+
+        return ResponseEntity.ok(new BalanceResponse(
+            accountId,
+            account.getBalance(),
+            Instant.now()
+        ));
+    }
+
+    /**
+     * Batch transfer with proper transaction handling.
+     */
+    @PostMapping("/batch")
+    @Transactional(rollbackFor = Exception.class)  // All or nothing
+    public ResponseEntity<BatchTransferResponse> batchTransfer(
+            @Valid @RequestBody List<TransferRequest> requests) {
+
+        String currentUserId = SecurityContext.getUserId();
+        List<TransferResult> results = new ArrayList<>();
+
+        // FIX: Validate ALL first before processing any
+        for (TransferRequest req : requests) {
+            validateTransferRequest(req, currentUserId);
+        }
+
+        // Process all (will all succeed or all rollback)
+        for (TransferRequest req : requests) {
+            TransferResult result = processTransfer(req, currentUserId);
+            results.add(result);
+        }
+
+        return ResponseEntity.ok(new BatchTransferResponse(results, "ALL_COMPLETED"));
+    }
+
+    private void validateTransferRequest(TransferRequest req, String userId) {
+        Account from = accountRepository.findById(req.getFromAccount())
+            .orElseThrow(() -> new AccountNotFoundException(req.getFromAccount()));
+
+        if (!Objects.equals(from.getOwnerId(), userId)) {
+            throw new UnauthorizedException("Not authorized");
+        }
+
+        if (from.getBalance().compareTo(req.getAmount()) < 0) {
+            throw new InsufficientBalanceException("Insufficient balance for: " + req.getFromAccount());
+        }
+    }
+
+    private TransferResult processTransfer(TransferRequest req, String userId) {
+        // Implementation similar to sendMoney but returns result object
+        return new TransferResult(UUID.randomUUID().toString(), "COMPLETED");
+    }
+}
+```
+
+### DTOs
+
+```java
+// Transfer Request
+public class TransferRequest {
+    @NotBlank(message = "Source account is required")
+    private String fromAccount;
+
+    @NotBlank(message = "Destination account is required")
+    private String toAccount;
+
+    @NotNull
+    @DecimalMin(value = "0.01", message = "Amount must be positive")
+    private BigDecimal amount;  // FIX: BigDecimal, not double
+
+    @Size(max = 500)
+    private String description;
+}
+
+// Transfer Response
+@Builder
+public class TransferResponse {
+    private String transferId;
+    private String fromAccount;
+    private String toAccount;
+    private BigDecimal amount;
+    private String status;
+    private Instant timestamp;
+}
+
+// Balance Response
+public record BalanceResponse(
+    String accountId,
+    BigDecimal balance,
+    Instant asOf
+) {}
+```
+
+### Custom Exceptions
+
+```java
+@ResponseStatus(HttpStatus.NOT_FOUND)
+public class AccountNotFoundException extends RuntimeException {
+    public AccountNotFoundException(String accountId) {
+        super("Account not found: " + accountId);
+    }
+}
+
+@ResponseStatus(HttpStatus.FORBIDDEN)
+public class UnauthorizedException extends RuntimeException { }
+
+@ResponseStatus(HttpStatus.UNPROCESSABLE_ENTITY)  // 422
+public class InsufficientBalanceException extends RuntimeException { }
+
+@ResponseStatus(HttpStatus.FORBIDDEN)
+public class FraudDetectedException extends RuntimeException { }
+```
+
+### Account Entity with Optimistic Locking
+
+```java
+@Entity
+public class Account {
+    @Id
+    private String id;
+
+    private String ownerId;
+
+    @Column(precision = 19, scale = 4)
+    private BigDecimal balance;  // FIX: BigDecimal
+
+    @Version  // FIX: Optimistic locking for race conditions
+    private Long version;
+}
+```
+
+### Key Fixes Summary (Same as Tide Interview!)
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| `staffOverride` from client | `@RequestParam boolean staffOverride` | `@PreAuthorize("hasRole('STAFF')")` |
+| Money type | `double` | `BigDecimal` |
+| Transaction | Missing | `@Transactional(rollbackFor = Exception.class)` |
+| Cache consistency | Static HashMap | Removed (or use Redis properly) |
+| Authorization | Client-controlled | `Objects.equals(owner, currentUser)` |
+| Balance check | `>` | `compareTo() >= 0` |
+| Transfer ID | `System.currentTimeMillis() + Random` | `UUID.randomUUID()` |
+| Thread safety | HashMap | ConcurrentHashMap or database |
+| Response | `void` | `ResponseEntity<TransferResponse>` |
+| Audit | Minimal | Detailed with all fields |
+| Fraud bypass | `&& !staffOverride` | No bypass possible |
+
+### Transaction Behavior
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    @Transactional                           │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ 1. BEGIN TRANSACTION                                  │  │
+│  │ 2. debit(fromAccount)   ← Executed but not committed │  │
+│  │ 3. credit(toAccount)    ← Executed but not committed │  │
+│  │ 4. save(transfer)       ← Executed but not committed │  │
+│  │ 5. COMMIT               ← All changes permanent      │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                             │
+│  If ANY step fails:                                         │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ ROLLBACK                ← All changes discarded      │  │
+│  └──────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────┘
+```
+
+</details>
+
