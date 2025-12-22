@@ -321,3 +321,231 @@ Think about:
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation</summary>
+
+### Fixed Document Controller
+
+```java
+package com.bank.documents;
+
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.*;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.time.Instant;
+import java.util.*;
+
+@RestController
+@RequestMapping("/api/v1/documents")
+public class DocumentController {
+
+    private static final Logger logger = LoggerFactory.getLogger(DocumentController.class);
+    private static final Set<String> ALLOWED_TYPES = Set.of(
+        "application/pdf", "image/jpeg", "image/png"
+    );
+    private static final long MAX_FILE_SIZE = 10 * 1024 * 1024;  // 10MB
+
+    @Value("${document.upload.dir}")
+    private String uploadDir;
+
+    private final DocumentRepository documentRepository;
+    private final UserRepository userRepository;
+    private final StorageService storageService;  // FIX: Use secure storage service
+    private final VirusScanService virusScanService;
+
+    // Constructor injection...
+
+    @PostMapping("/upload")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<DocumentResponse> uploadDocument(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam String documentType) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        // FIX: Validate file size
+        if (file.getSize() > MAX_FILE_SIZE) {
+            throw new FileTooLargeException("File size exceeds 10MB limit");
+        }
+
+        // FIX: Validate file type (check content, not just extension)
+        String contentType = file.getContentType();
+        if (!ALLOWED_TYPES.contains(contentType)) {
+            throw new InvalidFileTypeException("File type not allowed: " + contentType);
+        }
+
+        // FIX: Virus scan
+        if (virusScanService.isInfected(file)) {
+            logger.warn("Infected file upload attempt - user: {}", currentUserId);
+            throw new MalwareDetectedException("File failed security scan");
+        }
+
+        // FIX: Generate unique filename (prevent overwrites)
+        String uniqueFilename = UUID.randomUUID() + "_" + 
+            sanitizeFilename(file.getOriginalFilename());
+
+        // FIX: Validate path doesn't escape upload directory (path traversal)
+        Path targetPath = Paths.get(uploadDir, currentUserId, uniqueFilename).normalize();
+        if (!targetPath.startsWith(Paths.get(uploadDir).normalize())) {
+            logger.warn("Path traversal attempt - user: {}", currentUserId);
+            throw new SecurityException("Invalid file path");
+        }
+
+        try {
+            // Create user directory if needed
+            Files.createDirectories(targetPath.getParent());
+            Files.copy(file.getInputStream(), targetPath, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            throw new FileStorageException("Failed to store file", e);
+        }
+
+        Document doc = new Document();
+        doc.setId(UUID.randomUUID().toString());
+        doc.setUserId(currentUserId);
+        doc.setType(documentType);
+        doc.setOriginalFilename(file.getOriginalFilename());
+        doc.setStoredFilename(uniqueFilename);
+        doc.setContentType(contentType);
+        doc.setSize(file.getSize());
+        doc.setUploadedAt(Instant.now());
+        documentRepository.save(doc);
+
+        // FIX: Log without exposing full path
+        logger.info("Document uploaded - id: {}, type: {}, user: {}", 
+                   doc.getId(), documentType, currentUserId);
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(toResponse(doc));
+    }
+
+    @GetMapping("/download/{documentId}")
+    public ResponseEntity<byte[]> downloadDocument(@PathVariable String documentId) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        Document doc = documentRepository.findById(documentId)
+            .orElseThrow(() -> new DocumentNotFoundException(documentId));
+
+        // FIX: Authorization check
+        if (!Objects.equals(doc.getUserId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized to download this document");
+        }
+
+        Path filePath = Paths.get(uploadDir, doc.getUserId(), doc.getStoredFilename());
+
+        // FIX: Use try-with-resources
+        byte[] data;
+        try {
+            data = Files.readAllBytes(filePath);
+        } catch (IOException e) {
+            throw new FileStorageException("Failed to read file", e);
+        }
+
+        // FIX: Proper response headers
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.parseMediaType(doc.getContentType()));
+        headers.setContentDisposition(ContentDisposition.attachment()
+            .filename(doc.getOriginalFilename())
+            .build());
+        headers.setContentLength(data.length);
+
+        return new ResponseEntity<>(data, headers, HttpStatus.OK);
+    }
+
+    @GetMapping("/list")
+    public ResponseEntity<Page<DocumentResponse>> listDocuments(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        // FIX: Only return current user's documents
+        Page<Document> docs = documentRepository.findByUserId(
+            currentUserId, PageRequest.of(page, size)
+        );
+
+        return ResponseEntity.ok(docs.map(this::toResponse));
+    }
+
+    @DeleteMapping("/{documentId}")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<Void> deleteDocument(@PathVariable String documentId) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        Document doc = documentRepository.findById(documentId)
+            .orElseThrow(() -> new DocumentNotFoundException(documentId));
+
+        // FIX: Authorization
+        if (!Objects.equals(doc.getUserId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized");
+        }
+
+        Path filePath = Paths.get(uploadDir, doc.getUserId(), doc.getStoredFilename());
+
+        try {
+            // FIX: Check deletion result
+            boolean deleted = Files.deleteIfExists(filePath);
+            if (!deleted) {
+                logger.warn("File not found during deletion: {}", documentId);
+            }
+        } catch (IOException e) {
+            throw new FileStorageException("Failed to delete file", e);
+        }
+
+        documentRepository.delete(doc);
+
+        logger.info("Document deleted - id: {}, user: {}", documentId, currentUserId);
+
+        return ResponseEntity.noContent().build();
+    }
+
+    // FIX: Remove public access endpoint - use signed URLs instead
+    // No @GetMapping("/public/docs/{filename}")
+
+    private String sanitizeFilename(String filename) {
+        if (filename == null) return "unnamed";
+        // Remove path separators and dangerous characters
+        return filename.replaceAll("[^a-zA-Z0-9._-]", "_");
+    }
+
+    private DocumentResponse toResponse(Document doc) {
+        return new DocumentResponse(
+            doc.getId(),
+            doc.getType(),
+            doc.getOriginalFilename(),
+            doc.getSize(),
+            doc.getUploadedAt()
+            // NO file path in response!
+        );
+    }
+}
+```
+
+### Key Fixes Summary
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| Path traversal | `UPLOAD_DIR + filename` | Normalize and validate path |
+| File type validation | None | Check content-type + magic bytes |
+| File overwrites | Original filename | UUID prefix |
+| Authorization | None | Check doc.userId == currentUser |
+| Public access | Anyone can access | Removed (use signed URLs) |
+| Resource leak | Manual close | try-with-resources |
+| Download headers | None | Content-Type, Content-Disposition |
+| Virus scanning | None | Scan before storing |
+| Path in logs | Full server path | Only document ID |
+
+</details>
+

@@ -375,3 +375,297 @@ Think about:
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation</summary>
+
+### Fixed Subscription Controller
+
+```java
+package com.saas.billing;
+
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.*;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.*;
+
+@RestController
+@RequestMapping("/api/v1/subscriptions")
+public class SubscriptionController {
+
+    private static final Logger logger = LoggerFactory.getLogger(SubscriptionController.class);
+    private static final Duration TRIAL_PERIOD = Duration.ofDays(14);
+    private static final Duration BILLING_CYCLE = Duration.ofDays(30);
+
+    private final SubscriptionRepository subscriptionRepository;
+    private final CustomerRepository customerRepository;
+    private final PaymentService paymentService;
+    private final InvoiceService invoiceService;
+    private final PlanService planService;  // FIX: Get prices from service/DB
+    private final CouponService couponService;
+
+    // Constructor injection...
+
+    @PostMapping("/create")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<SubscriptionResponse> createSubscription(
+            @Valid @RequestBody CreateSubscriptionRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+        
+        Customer customer = customerRepository.findById(request.getCustomerId())
+            .orElseThrow(() -> new CustomerNotFoundException(request.getCustomerId()));
+
+        // FIX: Authorization
+        if (!Objects.equals(customer.getUserId(), currentUserId)) {
+            throw new UnauthorizedException("Cannot create subscription for another customer");
+        }
+
+        // FIX: Get plan price from database (not client)
+        Plan plan = planService.getPlan(request.getPlanId())
+            .orElseThrow(() -> new PlanNotFoundException(request.getPlanId()));
+
+        BigDecimal finalPrice = plan.getPrice();
+
+        // FIX: Validate coupon server-side (not discount percentage from client)
+        if (request.getCouponCode() != null) {
+            Coupon coupon = couponService.validateAndApply(request.getCouponCode(), plan.getId());
+            if (coupon != null) {
+                BigDecimal discount = finalPrice.multiply(coupon.getDiscountRate());
+                finalPrice = finalPrice.subtract(discount).setScale(2, RoundingMode.HALF_UP);
+            }
+        }
+
+        Subscription sub = new Subscription();
+        sub.setId(UUID.randomUUID().toString());
+        sub.setCustomerId(request.getCustomerId());
+        sub.setPlanId(request.getPlanId());
+        sub.setMonthlyPrice(finalPrice);
+        sub.setCreatedAt(Instant.now());
+
+        // FIX: Trial eligibility is server-side decision
+        if (customer.isEligibleForTrial()) {
+            sub.setTrialEndDate(Instant.now().plus(TRIAL_PERIOD));
+            sub.setStatus("TRIAL");
+            customer.setTrialUsed(true);
+            customerRepository.save(customer);
+        } else {
+            sub.setStatus("ACTIVE");
+            sub.setNextBillingDate(Instant.now().plus(BILLING_CYCLE));
+            
+            // Charge immediately
+            PaymentResult result = paymentService.charge(
+                request.getPaymentMethodId(),  // FIX: Payment method, not card token
+                finalPrice
+            );
+            
+            if (!result.isSuccess()) {
+                throw new PaymentFailedException(result.getErrorMessage());
+            }
+            
+            sub.setLastPaymentId(result.getPaymentId());
+        }
+
+        subscriptionRepository.save(sub);
+
+        logger.info("Subscription created - id: {}, plan: {}, price: {}", 
+                   sub.getId(), request.getPlanId(), finalPrice);
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(toResponse(sub));
+    }
+
+    @PostMapping("/cancel/{subscriptionId}")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<SubscriptionResponse> cancelSubscription(
+            @PathVariable String subscriptionId,
+            @RequestBody CancelRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        Subscription sub = subscriptionRepository.findById(subscriptionId)
+            .orElseThrow(() -> new SubscriptionNotFoundException(subscriptionId));
+
+        // FIX: Authorization
+        Customer customer = customerRepository.findById(sub.getCustomerId())
+            .orElseThrow(() -> new CustomerNotFoundException(sub.getCustomerId()));
+
+        if (!Objects.equals(customer.getUserId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized");
+        }
+
+        if (request.isImmediate()) {
+            sub.setStatus("CANCELLED");
+            sub.setCancelledAt(Instant.now());
+
+            // FIX: Refund is server-side policy decision
+            if (isEligibleForRefund(sub)) {
+                BigDecimal refundAmount = calculateProRatedRefund(sub);
+                if (refundAmount.compareTo(BigDecimal.ZERO) > 0) {
+                    paymentService.refund(sub.getLastPaymentId(), refundAmount);
+                    logger.info("Refund issued - subscription: {}, amount: {}", 
+                               subscriptionId, refundAmount);
+                }
+            }
+        } else {
+            sub.setStatus("PENDING_CANCEL");
+            sub.setCancelAtPeriodEnd(true);
+        }
+
+        subscriptionRepository.save(sub);
+
+        logger.info("Subscription cancelled - id: {}, immediate: {}", 
+                   subscriptionId, request.isImmediate());
+
+        return ResponseEntity.ok(toResponse(sub));
+    }
+
+    @PutMapping("/upgrade/{subscriptionId}")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<SubscriptionResponse> upgradePlan(
+            @PathVariable String subscriptionId,
+            @RequestBody UpgradeRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        Subscription sub = subscriptionRepository.findById(subscriptionId)
+            .orElseThrow(() -> new SubscriptionNotFoundException(subscriptionId));
+
+        // Authorization...
+
+        Plan newPlan = planService.getPlan(request.getNewPlanId())
+            .orElseThrow(() -> new PlanNotFoundException(request.getNewPlanId()));
+
+        BigDecimal oldPrice = sub.getMonthlyPrice();
+        BigDecimal newPrice = newPlan.getPrice();
+
+        // FIX: Handle both upgrade and downgrade
+        if (newPrice.compareTo(oldPrice) > 0) {
+            // Upgrade - charge prorated difference
+            BigDecimal proratedAmount = calculateProRatedCharge(sub, newPrice.subtract(oldPrice));
+            paymentService.charge(sub.getPaymentMethodId(), proratedAmount);
+        }
+        // Downgrade takes effect next billing cycle (no immediate refund)
+
+        sub.setPlanId(request.getNewPlanId());
+        sub.setMonthlyPrice(newPrice);
+        subscriptionRepository.save(sub);
+
+        logger.info("Subscription upgraded - id: {}, from: {} to: {}", 
+                   subscriptionId, oldPrice, newPrice);
+
+        return ResponseEntity.ok(toResponse(sub));
+    }
+
+    // FIX: Scheduled job should be in separate service, not controller
+    // See: SubscriptionBillingService.java
+
+    private BigDecimal calculateProRatedRefund(Subscription sub) {
+        if (sub.getNextBillingDate() == null) return BigDecimal.ZERO;
+        
+        long daysRemaining = ChronoUnit.DAYS.between(Instant.now(), sub.getNextBillingDate());
+        if (daysRemaining <= 0) return BigDecimal.ZERO;
+
+        return sub.getMonthlyPrice()
+            .multiply(BigDecimal.valueOf(daysRemaining))
+            .divide(BigDecimal.valueOf(30), 2, RoundingMode.HALF_UP);
+    }
+
+    private boolean isEligibleForRefund(Subscription sub) {
+        // Server-side refund policy
+        long daysSincePayment = ChronoUnit.DAYS.between(sub.getLastPaymentDate(), Instant.now());
+        return daysSincePayment <= 7;  // 7-day refund window
+    }
+}
+```
+
+### Billing Service (Scheduled Job)
+
+```java
+@Service
+public class SubscriptionBillingService {
+
+    private static final Logger logger = LoggerFactory.getLogger(SubscriptionBillingService.class);
+
+    @Scheduled(cron = "0 0 2 * * *")  // 2 AM daily
+    @Transactional
+    public void processRecurringBilling() {
+        List<Subscription> dueSubs = subscriptionRepository
+            .findByNextBillingDateBeforeAndStatus(Instant.now(), "ACTIVE");
+
+        List<BillingResult> results = new ArrayList<>();
+
+        for (Subscription sub : dueSubs) {
+            try {
+                processSingleBilling(sub);
+                results.add(new BillingResult(sub.getId(), true, null));
+            } catch (Exception e) {
+                // FIX: Continue with next, don't stop all billing
+                logger.error("Billing failed for subscription: {}", sub.getId(), e);
+                results.add(new BillingResult(sub.getId(), false, e.getMessage()));
+                handleFailedBilling(sub);
+            }
+        }
+
+        // Report results
+        long successful = results.stream().filter(BillingResult::isSuccess).count();
+        logger.info("Billing completed - total: {}, success: {}, failed: {}", 
+                   results.size(), successful, results.size() - successful);
+    }
+
+    private void processSingleBilling(Subscription sub) {
+        // FIX: Use .equals() for string comparison
+        if (!"ACTIVE".equals(sub.getStatus())) return;
+
+        PaymentResult result = paymentService.charge(
+            sub.getPaymentMethodId(), 
+            sub.getMonthlyPrice()
+        );
+
+        if (result.isSuccess()) {
+            sub.setNextBillingDate(Instant.now().plus(Duration.ofDays(30)));
+            sub.setLastPaymentId(result.getPaymentId());
+            sub.setLastPaymentDate(Instant.now());
+            subscriptionRepository.save(sub);
+        } else {
+            throw new PaymentFailedException(result.getErrorMessage());
+        }
+    }
+
+    private void handleFailedBilling(Subscription sub) {
+        sub.setFailedPaymentCount(sub.getFailedPaymentCount() + 1);
+        if (sub.getFailedPaymentCount() >= 3) {
+            sub.setStatus("SUSPENDED");
+        }
+        subscriptionRepository.save(sub);
+    }
+}
+```
+
+### Key Fixes Summary
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| `discountPercent` from client | Any % allowed | Validate coupon server-side |
+| `trialEnabled` from client | Free trials for all | Check customer.isEligibleForTrial() |
+| `refundEnabled` from client | Anyone triggers refund | Server-side refund policy |
+| Money | `double` | `BigDecimal` |
+| Integer overflow | `30 * 24 * 60 * 60 * 1000` | `Duration.ofDays(30)` |
+| String comparison | `==` | `.equals()` |
+| Scheduled job errors | Stops all billing | Continue, collect failures |
+| Card storage | Card token in DB | Payment method ID |
+
+</details>
+

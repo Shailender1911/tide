@@ -398,3 +398,340 @@ Think about:
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation</summary>
+
+### Fixed Rate Limiting Controller
+
+```java
+package com.platform.ratelimit;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.*;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.Instant;
+import java.util.Objects;
+import java.util.UUID;
+
+/**
+ * API Key and Rate Limiting Controller.
+ * Uses Redis for distributed rate limiting.
+ */
+@RestController
+@RequestMapping("/api/v1/rate-limit")
+public class RateLimitController {
+
+    private static final Logger logger = LoggerFactory.getLogger(RateLimitController.class);
+
+    @Value("${ratelimit.default:100}")
+    private int defaultRateLimit;
+
+    @Value("${ratelimit.window.seconds:60}")
+    private int windowSeconds;
+
+    private final ApiKeyRepository apiKeyRepository;
+    private final RateLimitService rateLimitService;  // FIX: Uses Redis
+
+    // Constructor injection...
+
+    /**
+     * Check rate limit for incoming request.
+     * API key passed in header, NOT query params.
+     */
+    @GetMapping("/check")
+    public ResponseEntity<RateLimitResponse> checkRateLimit(
+            @RequestHeader("X-API-Key") String apiKey,  // FIX: Header, not query param
+            @RequestParam String endpoint) {
+
+        // FIX: Validate API key from database
+        ApiKey key = apiKeyRepository.findByKeyHash(hashKey(apiKey))
+            .orElseThrow(() -> new InvalidApiKeyException("Invalid API key"));
+
+        // FIX: Use .equals() for string comparison
+        if (!"ACTIVE".equals(key.getStatus())) {
+            throw new InvalidApiKeyException("API key is not active");
+        }
+
+        String trackingKey = key.getId() + ":" + endpoint;
+        int limit = key.getRateLimit();
+
+        // FIX: Atomic rate limiting with Redis
+        RateLimitResult result = rateLimitService.checkAndIncrement(trackingKey, limit, windowSeconds);
+
+        if (!result.isAllowed()) {
+            logger.warn("Rate limit exceeded - keyId: {}, endpoint: {}", key.getId(), endpoint);
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("X-RateLimit-Limit", String.valueOf(limit))
+                .header("X-RateLimit-Remaining", "0")
+                .header("X-RateLimit-Reset", String.valueOf(result.getResetTime()))
+                .body(new RateLimitResponse(false, 0, result.getResetTime()));
+        }
+
+        return ResponseEntity.ok()
+            .header("X-RateLimit-Limit", String.valueOf(limit))
+            .header("X-RateLimit-Remaining", String.valueOf(result.getRemaining()))
+            .header("X-RateLimit-Reset", String.valueOf(result.getResetTime()))
+            .body(new RateLimitResponse(true, result.getRemaining(), result.getResetTime()));
+    }
+
+    @PostMapping("/keys")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ApiKeyResponse> createApiKey(
+            @Valid @RequestBody CreateApiKeyRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        // Generate secure API key
+        String rawKey = generateSecureKey();
+        String keyHash = hashKey(rawKey);
+
+        ApiKey key = new ApiKey();
+        key.setId(UUID.randomUUID().toString());
+        key.setKeyHash(keyHash);  // FIX: Store hash, not plain key
+        key.setKeyPrefix(rawKey.substring(0, 8));  // For display only
+        key.setName(request.getKeyName());
+        key.setUserId(currentUserId);
+        key.setRateLimit(defaultRateLimit);
+        key.setStatus("ACTIVE");
+        key.setCreatedAt(Instant.now());
+
+        apiKeyRepository.save(key);
+
+        // FIX: Log key ID, never the actual key
+        logger.info("API key created - id: {}, userId: {}", key.getId(), currentUserId);
+
+        // FIX: Return key ONCE only (never stored in plain text)
+        return ResponseEntity.status(HttpStatus.CREATED).body(
+            new ApiKeyResponse(
+                key.getId(),
+                rawKey,  // Only time the full key is returned
+                key.getName(),
+                key.getRateLimit(),
+                "IMPORTANT: Store this key securely. It cannot be retrieved again."
+            )
+        );
+    }
+
+    @DeleteMapping("/keys/{keyId}")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<Void> revokeApiKey(@PathVariable String keyId) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        ApiKey key = apiKeyRepository.findById(keyId)
+            .orElseThrow(() -> new ApiKeyNotFoundException(keyId));
+
+        // FIX: Authorization - can only revoke own keys
+        if (!Objects.equals(key.getUserId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized to revoke this key");
+        }
+
+        key.setStatus("REVOKED");
+        key.setRevokedAt(Instant.now());
+        apiKeyRepository.save(key);
+
+        logger.info("API key revoked - id: {}, by: {}", keyId, currentUserId);
+
+        return ResponseEntity.noContent().build();
+    }
+
+    @PutMapping("/keys/{keyId}/limit")
+    @PreAuthorize("hasRole('ADMIN')")  // FIX: Only admin can change limits
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ApiKeyResponse> updateRateLimit(
+            @PathVariable String keyId,
+            @Valid @RequestBody UpdateLimitRequest request) {
+
+        String adminUserId = SecurityContext.getCurrentUserId();
+
+        ApiKey key = apiKeyRepository.findById(keyId)
+            .orElseThrow(() -> new ApiKeyNotFoundException(keyId));
+
+        // FIX: Validate limit is reasonable
+        if (request.getNewLimit() <= 0 || request.getNewLimit() > 10000) {
+            throw new InvalidLimitException("Limit must be between 1 and 10000");
+        }
+
+        int oldLimit = key.getRateLimit();
+        key.setRateLimit(request.getNewLimit());
+        apiKeyRepository.save(key);
+
+        logger.info("Rate limit updated - keyId: {}, from: {} to: {}, by: {}", 
+                   keyId, oldLimit, request.getNewLimit(), adminUserId);
+
+        return ResponseEntity.ok(new ApiKeyResponse(
+            key.getId(),
+            null,  // Never return the key again
+            key.getName(),
+            key.getRateLimit(),
+            null
+        ));
+    }
+
+    @GetMapping("/keys/{keyId}/usage")
+    public ResponseEntity<UsageResponse> getUsage(@PathVariable String keyId) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        ApiKey key = apiKeyRepository.findById(keyId)
+            .orElseThrow(() -> new ApiKeyNotFoundException(keyId));
+
+        // FIX: Authorization
+        if (!Objects.equals(key.getUserId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized");
+        }
+
+        // FIX: Get usage from Redis (tracking key is keyId:*)
+        Map<String, Long> usageByEndpoint = rateLimitService.getUsageStats(key.getId());
+
+        return ResponseEntity.ok(new UsageResponse(
+            key.getId(),
+            key.getRateLimit(),
+            usageByEndpoint,
+            Instant.now()
+        ));
+    }
+
+    @GetMapping("/keys")
+    public ResponseEntity<List<ApiKeyListResponse>> listApiKeys() {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        // FIX: Only return current user's keys
+        List<ApiKey> keys = apiKeyRepository.findByUserId(currentUserId);
+
+        // FIX: Return DTO with masked key
+        List<ApiKeyListResponse> response = keys.stream()
+            .map(k -> new ApiKeyListResponse(
+                k.getId(),
+                k.getKeyPrefix() + "..." + "*".repeat(24),  // Masked
+                k.getName(),
+                k.getRateLimit(),
+                k.getStatus(),
+                k.getCreatedAt()
+            ))
+            .toList();
+
+        return ResponseEntity.ok(response);
+    }
+
+    // FIX: REMOVED @PostMapping("/reset") - no public reset capability
+
+    private String generateSecureKey() {
+        // Generate cryptographically secure API key
+        return UUID.randomUUID().toString().replace("-", "") +
+               UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+    }
+
+    private String hashKey(String rawKey) {
+        // Use secure hashing (SHA-256 or bcrypt)
+        return EncryptionUtils.hash(rawKey);
+    }
+}
+```
+
+### Redis-based Rate Limit Service
+
+```java
+@Service
+public class RateLimitService {
+
+    private final StringRedisTemplate redisTemplate;
+
+    /**
+     * Atomic rate limit check using Redis INCR with expiry.
+     * Thread-safe and works in distributed environment.
+     */
+    public RateLimitResult checkAndIncrement(String key, int limit, int windowSeconds) {
+        String redisKey = "ratelimit:" + key;
+
+        // Atomic increment
+        Long count = redisTemplate.opsForValue().increment(redisKey);
+        
+        if (count == 1) {
+            // First request in window - set expiry
+            redisTemplate.expire(redisKey, Duration.ofSeconds(windowSeconds));
+        }
+
+        Long ttl = redisTemplate.getExpire(redisKey, TimeUnit.SECONDS);
+        long resetTime = Instant.now().plusSeconds(ttl != null ? ttl : windowSeconds).getEpochSecond();
+
+        boolean allowed = count <= limit;
+        int remaining = allowed ? limit - count.intValue() : 0;
+
+        return new RateLimitResult(allowed, remaining, resetTime);
+    }
+
+    public Map<String, Long> getUsageStats(String keyId) {
+        // Get all keys matching pattern
+        Set<String> keys = redisTemplate.keys("ratelimit:" + keyId + ":*");
+        Map<String, Long> stats = new HashMap<>();
+        
+        for (String key : keys) {
+            String endpoint = key.substring(key.lastIndexOf(":") + 1);
+            String value = redisTemplate.opsForValue().get(key);
+            stats.put(endpoint, value != null ? Long.parseLong(value) : 0);
+        }
+        
+        return stats;
+    }
+}
+```
+
+### Key Fixes Summary
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| `unlimitedAccess` | Client parameter | REMOVED |
+| `isAdmin` for reset | Client parameter | REMOVED reset endpoint |
+| `showAll` for list | Client parameter | Only user's own keys |
+| API key in URL | Query param | `X-API-Key` header |
+| API key logged | Plain text in logs | Only log key ID |
+| Thread safety | HashMap | Redis (distributed & atomic) |
+| Race condition | Check-then-increment | Atomic INCR in Redis |
+| Distributed | Static in-memory | Redis shared across instances |
+| String comparison | `!=` | `.equals()` |
+| Key storage | Plain text | Store hash only |
+| Key in response | Full key in list | Masked prefix |
+| Authorization | None | Check userId on all operations |
+
+### Redis Rate Limit Flow
+
+```
+Request comes in with X-API-Key header
+        │
+        ▼
+┌───────────────────────────┐
+│ 1. Lookup key by hash     │
+│ 2. Validate key is ACTIVE │
+└───────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────────────────┐
+│ Redis: INCR ratelimit:{keyId}:{endpoint}  │
+│        (Atomic - no race condition)       │
+│ If first request: EXPIRE key {window}s   │
+└───────────────────────────────────────────┘
+        │
+        ▼
+count <= limit? ──No──▶ 429 Too Many Requests
+        │
+       Yes
+        │
+        ▼
+    200 OK (with rate limit headers)
+```
+
+</details>
+

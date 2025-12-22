@@ -392,3 +392,241 @@ Think about:
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation</summary>
+
+### Fixed Forex Controller
+
+```java
+package com.bank.forex;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.*;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Instant;
+import java.util.*;
+
+@RestController
+@RequestMapping("/api/v1/forex")
+public class ForexController {
+
+    private static final Logger logger = LoggerFactory.getLogger(ForexController.class);
+    private static final Set<String> VALID_CURRENCIES = Set.of("USD", "EUR", "GBP", "JPY", "INR");
+
+    @Value("${forex.fee.percentage:0.02}")
+    private BigDecimal feePercentage;
+
+    @Value("${forex.max.transaction:100000}")
+    private BigDecimal maxTransactionAmount;
+
+    private final AccountRepository accountRepository;
+    private final ForexTransactionRepository transactionRepository;
+    private final RatesService ratesService;  // FIX: External rates service
+
+    // Constructor injection...
+
+    @PostMapping("/convert")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ConversionResponse> convertCurrency(
+            @Valid @RequestBody ConversionRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        // FIX: Validate currencies
+        if (!VALID_CURRENCIES.contains(request.getFromCurrency()) ||
+            !VALID_CURRENCIES.contains(request.getToCurrency())) {
+            throw new InvalidCurrencyException("Invalid currency code");
+        }
+
+        Account account = accountRepository.findById(request.getAccountId())
+            .orElseThrow(() -> new AccountNotFoundException(request.getAccountId()));
+
+        // FIX: Authorization
+        if (!Objects.equals(account.getOwnerId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized");
+        }
+
+        // FIX: Validate amount
+        if (request.getAmount().compareTo(maxTransactionAmount) > 0) {
+            throw new AmountExceedsLimitException("Amount exceeds maximum: " + maxTransactionAmount);
+        }
+
+        // FIX: Get rate from external source with timestamp
+        RateQuote quote = ratesService.getRate(request.getFromCurrency(), request.getToCurrency());
+        BigDecimal rate = quote.getRate();
+
+        // FIX: Get balance with null safety
+        Map<String, BigDecimal> balances = account.getCurrencyBalances();
+        BigDecimal currentBalance = balances.getOrDefault(request.getFromCurrency(), BigDecimal.ZERO);
+
+        // Calculate with BigDecimal
+        BigDecimal fee = request.getAmount().multiply(feePercentage).setScale(2, RoundingMode.HALF_UP);
+        BigDecimal totalDebit = request.getAmount().add(fee);
+        BigDecimal convertedAmount = request.getAmount().multiply(rate).setScale(2, RoundingMode.HALF_UP);
+
+        // FIX: Use compareTo for BigDecimal
+        if (currentBalance.compareTo(totalDebit) < 0) {
+            throw new InsufficientBalanceException(
+                String.format("Insufficient balance. Available: %s, Required: %s", 
+                             currentBalance, totalDebit));
+        }
+
+        // FIX: Atomic update
+        balances.put(request.getFromCurrency(), currentBalance.subtract(totalDebit));
+        BigDecimal toBalance = balances.getOrDefault(request.getToCurrency(), BigDecimal.ZERO);
+        balances.put(request.getToCurrency(), toBalance.add(convertedAmount));
+        accountRepository.save(account);
+
+        // FIX: UUID for transaction ID
+        ForexTransaction tx = new ForexTransaction();
+        tx.setId(UUID.randomUUID().toString());
+        tx.setAccountId(request.getAccountId());
+        tx.setFromCurrency(request.getFromCurrency());
+        tx.setToCurrency(request.getToCurrency());
+        tx.setAmount(request.getAmount());
+        tx.setConvertedAmount(convertedAmount);
+        tx.setRate(rate);
+        tx.setRateQuoteId(quote.getQuoteId());
+        tx.setFee(fee);
+        tx.setTimestamp(Instant.now());
+        transactionRepository.save(tx);
+
+        // FIX: Detailed logging
+        logger.info("FX conversion - txId: {}, account: {}, {} {} -> {} {} @ {}, fee: {}", 
+                   tx.getId(), request.getAccountId(),
+                   request.getAmount(), request.getFromCurrency(),
+                   convertedAmount, request.getToCurrency(), rate, fee);
+
+        // FIX: Return proper response
+        return ResponseEntity.status(HttpStatus.CREATED).body(
+            ConversionResponse.builder()
+                .transactionId(tx.getId())
+                .fromAmount(request.getAmount())
+                .fromCurrency(request.getFromCurrency())
+                .toAmount(convertedAmount)
+                .toCurrency(request.getToCurrency())
+                .rate(rate)
+                .fee(fee)
+                .timestamp(tx.getTimestamp())
+                .build()
+        );
+    }
+
+    @GetMapping("/rates")
+    public ResponseEntity<RatesResponse> getRate(
+            @RequestParam @Pattern(regexp = "[A-Z]{3}") String from,
+            @RequestParam @Pattern(regexp = "[A-Z]{3}") String to) {
+
+        if (!VALID_CURRENCIES.contains(from) || !VALID_CURRENCIES.contains(to)) {
+            throw new InvalidCurrencyException("Invalid currency code");
+        }
+
+        RateQuote quote = ratesService.getRate(from, to);
+
+        return ResponseEntity.ok(new RatesResponse(
+            from,
+            to,
+            quote.getRate(),
+            quote.getBidRate(),   // FIX: Include bid/ask
+            quote.getAskRate(),
+            quote.getTimestamp(), // FIX: Include timestamp
+            quote.getQuoteId()
+        ));
+    }
+
+    @GetMapping("/history")
+    public ResponseEntity<Page<TransactionResponse>> getHistory(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") @Max(100) int size) {  // FIX: Bounded limit
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        Page<ForexTransaction> transactions = transactionRepository
+            .findByAccountOwner(currentUserId, PageRequest.of(page, size, Sort.by("timestamp").descending()));
+
+        return ResponseEntity.ok(transactions.map(this::toResponse));
+    }
+
+    @PostMapping("/bulk-convert")
+    @Transactional(rollbackFor = Exception.class)  // FIX: All or nothing
+    public ResponseEntity<BulkConversionResponse> bulkConvert(
+            @Valid @RequestBody List<ConversionRequest> requests) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        // FIX: Validate ALL first
+        for (ConversionRequest req : requests) {
+            validateRequest(req, currentUserId);
+        }
+
+        // Process all (atomic)
+        List<ConversionResponse> results = new ArrayList<>();
+        for (ConversionRequest req : requests) {
+            ConversionResponse response = convertCurrency(req).getBody();
+            results.add(response);
+        }
+
+        return ResponseEntity.ok(new BulkConversionResponse(results, "ALL_COMPLETED"));
+    }
+
+    private void validateRequest(ConversionRequest req, String userId) {
+        Account account = accountRepository.findById(req.getAccountId())
+            .orElseThrow(() -> new AccountNotFoundException(req.getAccountId()));
+
+        if (!Objects.equals(account.getOwnerId(), userId)) {
+            throw new UnauthorizedException("Not authorized for account: " + req.getAccountId());
+        }
+
+        BigDecimal balance = account.getCurrencyBalances()
+            .getOrDefault(req.getFromCurrency(), BigDecimal.ZERO);
+        BigDecimal required = req.getAmount().add(req.getAmount().multiply(feePercentage));
+
+        if (balance.compareTo(required) < 0) {
+            throw new InsufficientBalanceException("Insufficient balance in " + req.getFromCurrency());
+        }
+    }
+
+    private TransactionResponse toResponse(ForexTransaction tx) {
+        return new TransactionResponse(
+            tx.getId(),
+            tx.getFromCurrency(),
+            tx.getToCurrency(),
+            tx.getAmount(),
+            tx.getConvertedAmount(),
+            tx.getRate(),
+            tx.getFee(),
+            tx.getTimestamp()
+        );
+    }
+}
+```
+
+### Key Fixes Summary
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| Money type | `double` | `BigDecimal` |
+| Rate source | Static HashMap | External rates service |
+| `customRate` from client | Anyone can set rate | REMOVED |
+| `waiveFee` from client | Anyone waives fee | Server-side policy only |
+| Authorization | None | Check account ownership |
+| Transaction ID | `currentTimeMillis + Random` | UUID |
+| Balance lookup | NPE possible | `getOrDefault(key, ZERO)` |
+| Transaction | Missing | `@Transactional` |
+| Response | `void` | Full conversion details |
+| Currency validation | None | ISO 4217 codes |
+
+</details>
+

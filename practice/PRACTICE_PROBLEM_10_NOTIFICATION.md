@@ -363,3 +363,285 @@ Think about:
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation</summary>
+
+### Fixed Notification Controller
+
+```java
+package com.platform.notifications;
+
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.http.*;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+@RestController
+@RequestMapping("/api/v1/notifications")
+public class NotificationController {
+
+    private static final Logger logger = LoggerFactory.getLogger(NotificationController.class);
+    private static final Set<String> VALID_CHANNELS = Set.of("EMAIL", "SMS", "PUSH");
+
+    private final EmailService emailService;
+    private final SmsService smsService;
+    private final PushService pushService;
+    private final UserRepository userRepository;
+    private final TemplateRepository templateRepository;
+    private final NotificationLogRepository notificationLogRepository;
+    private final ScheduledNotificationRepository scheduledNotificationRepository;
+
+    // Constructor injection...
+
+    @PostMapping("/send")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<NotificationResponse> sendNotification(
+            @Valid @RequestBody SendNotificationRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        // FIX: Authorization - can only send to self or with ADMIN role
+        if (!Objects.equals(request.getUserId(), currentUserId) && 
+            !SecurityContext.hasRole("ADMIN")) {
+            throw new UnauthorizedException("Cannot send notifications to other users");
+        }
+
+        User user = userRepository.findById(request.getUserId())
+            .orElseThrow(() -> new UserNotFoundException(request.getUserId()));
+
+        // FIX: Check user preferences before sending
+        NotificationPreferences prefs = user.getNotificationPreferences();
+        if (!isChannelEnabled(request.getChannel(), prefs)) {
+            logger.info("Notification skipped - user opted out of channel: {}", request.getChannel());
+            return ResponseEntity.ok(new NotificationResponse(null, "SKIPPED_USER_PREFERENCE"));
+        }
+
+        // FIX: Validate channel
+        if (!VALID_CHANNELS.contains(request.getChannel())) {
+            throw new InvalidChannelException("Invalid channel: " + request.getChannel());
+        }
+
+        Template template = templateRepository.findById(request.getTemplateId())
+            .orElseThrow(() -> new TemplateNotFoundException(request.getTemplateId()));
+
+        String message = template.getContent().replace("{{name}}", user.getName());
+        if (request.getCustomMessage() != null) {
+            message = message + " " + request.getCustomMessage();
+        }
+
+        // FIX: Database-based deduplication
+        String deduplicationKey = generateDeduplicationKey(request);
+        if (notificationLogRepository.existsByDeduplicationKey(deduplicationKey)) {
+            logger.info("Duplicate notification prevented - key: {}", deduplicationKey);
+            return ResponseEntity.ok(new NotificationResponse(null, "DUPLICATE"));
+        }
+
+        String notificationId = UUID.randomUUID().toString();
+
+        // Send based on channel
+        switch (request.getChannel()) {
+            case "EMAIL" -> emailService.send(user.getEmail(), template.getSubject(), message);
+            case "SMS" -> smsService.send(user.getPhone(), message);
+            case "PUSH" -> pushService.send(user.getDeviceToken(), template.getTitle(), message);
+            default -> throw new InvalidChannelException("Unknown channel");
+        }
+
+        // Log the notification (for deduplication and audit)
+        NotificationLog log = new NotificationLog();
+        log.setId(notificationId);
+        log.setUserId(request.getUserId());
+        log.setChannel(request.getChannel());
+        log.setTemplateId(request.getTemplateId());
+        log.setDeduplicationKey(deduplicationKey);
+        log.setSentAt(Instant.now());
+        log.setStatus("SENT");
+        notificationLogRepository.save(log);
+
+        // FIX: Log WITHOUT PII
+        logger.info("Notification sent - id: {}, userId: {}, channel: {}", 
+                   notificationId, request.getUserId(), request.getChannel());
+
+        return ResponseEntity.status(HttpStatus.CREATED)
+            .body(new NotificationResponse(notificationId, "SENT"));
+    }
+
+    @PostMapping("/broadcast")
+    @PreAuthorize("hasRole('ADMIN')")  // FIX: Server-side admin check
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<BroadcastResponse> broadcastNotification(
+            @Valid @RequestBody BroadcastRequest request) {
+
+        String adminUserId = SecurityContext.getCurrentUserId();
+
+        Template template = templateRepository.findById(request.getTemplateId())
+            .orElseThrow(() -> new TemplateNotFoundException(request.getTemplateId()));
+
+        // FIX: Stream/paginate to avoid memory issues
+        int totalSent = 0;
+        int page = 0;
+        int pageSize = 100;
+
+        while (true) {
+            Page<User> usersPage = userRepository.findAll(Pageable.ofSize(pageSize).withPage(page));
+            
+            for (User user : usersPage.getContent()) {
+                try {
+                    sendToUser(user, request.getChannel(), template);
+                    totalSent++;
+                } catch (Exception e) {
+                    logger.error("Broadcast failed for user: {}", user.getId(), e);
+                }
+            }
+
+            if (!usersPage.hasNext()) break;
+            page++;
+        }
+
+        logger.info("Broadcast completed - admin: {}, template: {}, sent: {}", 
+                   adminUserId, request.getTemplateId(), totalSent);
+
+        return ResponseEntity.ok(new BroadcastResponse(totalSent, "COMPLETED"));
+    }
+
+    @GetMapping("/preferences")
+    public ResponseEntity<PreferencesResponse> getPreferences() {
+        // FIX: Only return current user's preferences
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        User user = userRepository.findById(currentUserId)
+            .orElseThrow(() -> new UserNotFoundException(currentUserId));
+
+        NotificationPreferences prefs = user.getNotificationPreferences();
+        return ResponseEntity.ok(new PreferencesResponse(
+            prefs.isEmailEnabled(),
+            prefs.isSmsEnabled(),
+            prefs.isPushEnabled()
+        ));
+    }
+
+    @PutMapping("/preferences")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<PreferencesResponse> updatePreferences(
+            @Valid @RequestBody UpdatePreferencesRequest request) {
+
+        // FIX: Only update current user's preferences
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        User user = userRepository.findById(currentUserId)
+            .orElseThrow(() -> new UserNotFoundException(currentUserId));
+
+        NotificationPreferences prefs = user.getNotificationPreferences();
+        prefs.setEmailEnabled(request.isEmailEnabled());
+        prefs.setSmsEnabled(request.isSmsEnabled());
+        prefs.setPushEnabled(request.isPushEnabled());
+        userRepository.save(user);
+
+        logger.info("Preferences updated - userId: {}", currentUserId);
+
+        return ResponseEntity.ok(new PreferencesResponse(
+            request.isEmailEnabled(),
+            request.isSmsEnabled(),
+            request.isPushEnabled()
+        ));
+    }
+
+    @PostMapping("/schedule")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ScheduleResponse> scheduleNotification(
+            @Valid @RequestBody ScheduleRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        ScheduledNotification sn = new ScheduledNotification();
+        sn.setId(UUID.randomUUID().toString());
+        sn.setUserId(request.getUserId());
+        sn.setChannel(request.getChannel());
+        sn.setTemplateId(request.getTemplateId());
+        sn.setScheduledTime(request.getScheduledTime());  // Instant type
+        sn.setStatus("PENDING");
+        sn.setCreatedBy(currentUserId);
+        sn.setCreatedAt(Instant.now());
+
+        // FIX: Actually save to database!
+        scheduledNotificationRepository.save(sn);
+
+        logger.info("Notification scheduled - id: {}, for: {}", sn.getId(), request.getScheduledTime());
+
+        return ResponseEntity.status(HttpStatus.CREATED)
+            .body(new ScheduleResponse(sn.getId(), request.getScheduledTime()));
+    }
+
+    @PostMapping("/unsubscribe")  // FIX: POST with token, not DELETE with email
+    public ResponseEntity<Void> unsubscribe(
+            @RequestParam String token) {  // FIX: Signed token, not raw email
+
+        // Validate and decode the unsubscribe token
+        UnsubscribeToken decoded = tokenService.validateUnsubscribeToken(token);
+        if (decoded == null) {
+            throw new InvalidTokenException("Invalid or expired unsubscribe token");
+        }
+
+        User user = userRepository.findById(decoded.getUserId())
+            .orElseThrow(() -> new UserNotFoundException(decoded.getUserId()));
+
+        NotificationPreferences prefs = user.getNotificationPreferences();
+
+        // FIX: Use .equals() for string comparison
+        if ("EMAIL".equals(decoded.getChannel())) {
+            prefs.setEmailEnabled(false);
+        } else if ("SMS".equals(decoded.getChannel())) {
+            prefs.setSmsEnabled(false);
+        }
+
+        userRepository.save(user);
+
+        logger.info("User unsubscribed - userId: {}, channel: {}", 
+                   decoded.getUserId(), decoded.getChannel());
+
+        return ResponseEntity.ok().build();
+    }
+
+    private boolean isChannelEnabled(String channel, NotificationPreferences prefs) {
+        return switch (channel) {
+            case "EMAIL" -> prefs.isEmailEnabled();
+            case "SMS" -> prefs.isSmsEnabled();
+            case "PUSH" -> prefs.isPushEnabled();
+            default -> false;
+        };
+    }
+
+    private String generateDeduplicationKey(SendNotificationRequest request) {
+        return request.getUserId() + "-" + request.getTemplateId() + "-" + 
+               Instant.now().truncatedTo(java.time.temporal.ChronoUnit.HOURS).toEpochMilli();
+    }
+}
+```
+
+### Key Fixes Summary
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| `testMode` from client | Client can broadcast | `@PreAuthorize("hasRole('ADMIN')")` |
+| User preferences | Not checked | Check before sending |
+| PII in logs | Email, phone logged | Only userId logged |
+| Deduplication | Static HashSet | Database-based |
+| String comparison | `==` | `.equals()` |
+| Scheduled notification | Not saved | Save to database |
+| Unsubscribe | Raw email | Signed token |
+| Broadcast memory | findAll() | Paginated streaming |
+
+</details>
+

@@ -340,3 +340,252 @@ Think about:
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation</summary>
+
+### Fixed Invoice Controller
+
+```java
+package com.bank.invoicing;
+
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.*;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.util.Objects;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/v1/invoices")
+public class InvoiceController {
+
+    private static final Logger logger = LoggerFactory.getLogger(InvoiceController.class);
+
+    private final InvoiceRepository invoiceRepository;
+    private final BusinessRepository businessRepository;
+    private final EmailService emailService;
+    private final PdfGenerator pdfGenerator;
+    private final InvoiceNumberService invoiceNumberService;  // FIX: DB-based invoice numbers
+
+    // Constructor injection...
+
+    @PostMapping("/create")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<InvoiceResponse> createInvoice(
+            @Valid @RequestBody InvoiceCreateRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        Business business = businessRepository.findById(request.getBusinessId())
+            .orElseThrow(() -> new BusinessNotFoundException(request.getBusinessId()));
+
+        // FIX: Authorization - verify business ownership
+        if (!Objects.equals(business.getOwnerId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized to create invoices for this business");
+        }
+
+        // FIX: Database-generated invoice number (thread-safe)
+        String invoiceNumber = invoiceNumberService.generateNextNumber(request.getBusinessId());
+
+        Invoice invoice = new Invoice();
+        invoice.setId(UUID.randomUUID().toString());
+        invoice.setInvoiceNumber(invoiceNumber);
+        invoice.setBusinessId(request.getBusinessId());
+        invoice.setCustomerEmail(request.getCustomerEmail());
+        invoice.setCustomerName(request.getCustomerName());
+
+        // FIX: BigDecimal for money with proper rounding
+        BigDecimal amount = request.getAmount();
+        BigDecimal taxAmount = amount.multiply(request.getTaxRate())
+            .setScale(2, RoundingMode.HALF_UP);
+        BigDecimal totalAmount = amount.add(taxAmount);
+
+        invoice.setAmount(amount);
+        invoice.setTaxRate(request.getTaxRate());
+        invoice.setTaxAmount(taxAmount);
+        invoice.setTotalAmount(totalAmount);
+        invoice.setDescription(request.getDescription());
+        invoice.setDueDate(request.getDueDate());  // FIX: LocalDate type
+        invoice.setStatus("DRAFT");
+        invoice.setCreatedAt(Instant.now());
+
+        invoiceRepository.save(invoice);
+
+        logger.info("Invoice created - number: {}, business: {}, total: {}", 
+                   invoiceNumber, request.getBusinessId(), totalAmount);
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(toResponse(invoice));
+    }
+
+    @PutMapping("/send/{invoiceId}")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<InvoiceResponse> sendInvoice(@PathVariable String invoiceId) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        Invoice invoice = invoiceRepository.findById(invoiceId)
+            .orElseThrow(() -> new InvoiceNotFoundException(invoiceId));
+
+        // FIX: Authorization
+        Business business = businessRepository.findById(invoice.getBusinessId())
+            .orElseThrow(() -> new BusinessNotFoundException(invoice.getBusinessId()));
+
+        if (!Objects.equals(business.getOwnerId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized");
+        }
+
+        byte[] pdf = pdfGenerator.generate(invoice);
+
+        emailService.sendWithAttachment(
+            invoice.getCustomerEmail(),
+            "Invoice from " + business.getName(),
+            "Please find attached invoice for " + invoice.getTotalAmount(),
+            pdf
+        );
+
+        invoice.setStatus("SENT");
+        invoice.setSentAt(Instant.now());
+        invoiceRepository.save(invoice);
+
+        logger.info("Invoice sent - id: {}, to: {}", invoiceId, invoice.getCustomerEmail());
+
+        return ResponseEntity.ok(toResponse(invoice));
+    }
+
+    @PostMapping("/mark-paid/{invoiceId}")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<InvoiceResponse> markAsPaid(
+            @PathVariable String invoiceId,
+            @Valid @RequestBody MarkPaidRequest request) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        Invoice invoice = invoiceRepository.findById(invoiceId)
+            .orElseThrow(() -> new InvoiceNotFoundException(invoiceId));
+
+        // FIX: Authorization
+        Business business = businessRepository.findById(invoice.getBusinessId())
+            .orElseThrow(() -> new BusinessNotFoundException(invoice.getBusinessId()));
+
+        if (!Objects.equals(business.getOwnerId(), currentUserId)) {
+            throw new UnauthorizedException("Not authorized");
+        }
+
+        // FIX: Use BigDecimal.compareTo()
+        if (request.getPaidAmount().compareTo(invoice.getTotalAmount()) != 0) {
+            // Require exact match or throw clear error
+            throw new PaymentMismatchException(
+                String.format("Payment amount %s does not match invoice total %s", 
+                             request.getPaidAmount(), invoice.getTotalAmount()));
+        }
+
+        invoice.setStatus("PAID");
+        invoice.setPaidAmount(request.getPaidAmount());
+        invoice.setPaidAt(Instant.now());
+        invoiceRepository.save(invoice);
+
+        logger.info("Invoice marked paid - id: {}, amount: {}", invoiceId, request.getPaidAmount());
+
+        return ResponseEntity.ok(toResponse(invoice));
+    }
+
+    @DeleteMapping("/{invoiceId}")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<Void> deleteInvoice(@PathVariable String invoiceId) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        Invoice invoice = invoiceRepository.findById(invoiceId)
+            .orElseThrow(() -> new InvoiceNotFoundException(invoiceId));
+
+        // Authorization check...
+
+        // FIX: Soft delete for legal compliance
+        invoice.setStatus("DELETED");
+        invoice.setDeletedAt(Instant.now());
+        invoice.setDeletedBy(currentUserId);
+        invoiceRepository.save(invoice);
+
+        logger.info("Invoice soft-deleted - id: {}, by: {}", invoiceId, currentUserId);
+
+        return ResponseEntity.noContent().build();
+    }
+
+    @GetMapping("/download/{invoiceId}")
+    public ResponseEntity<byte[]> downloadInvoice(@PathVariable String invoiceId) {
+
+        Invoice invoice = invoiceRepository.findById(invoiceId)
+            .orElseThrow(() -> new InvoiceNotFoundException(invoiceId));
+
+        // Authorization check...
+
+        byte[] pdf = pdfGenerator.generate(invoice);
+
+        // FIX: Proper response headers
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_PDF);
+        headers.setContentDisposition(ContentDisposition.attachment()
+            .filename("invoice-" + invoice.getInvoiceNumber() + ".pdf")
+            .build());
+
+        return new ResponseEntity<>(pdf, headers, HttpStatus.OK);
+    }
+
+    @GetMapping("/list")
+    public ResponseEntity<Page<InvoiceResponse>> getInvoices(
+            @RequestParam String businessId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {  // FIX: Pagination
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        // Authorization check...
+
+        Page<Invoice> invoices = invoiceRepository.findByBusinessId(
+            businessId, PageRequest.of(page, size, Sort.by("createdAt").descending())
+        );
+
+        return ResponseEntity.ok(invoices.map(this::toResponse));
+    }
+
+    private InvoiceResponse toResponse(Invoice invoice) {
+        return new InvoiceResponse(
+            invoice.getId(),
+            invoice.getInvoiceNumber(),
+            invoice.getCustomerName(),
+            invoice.getTotalAmount(),
+            invoice.getStatus(),
+            invoice.getDueDate(),
+            invoice.getCreatedAt()
+        );
+    }
+}
+```
+
+### Key Fixes Summary
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| Invoice number | Static counter | Database sequence service |
+| `overrideMismatch` | Client parameter | Removed - require exact match |
+| Money type | `double` | `BigDecimal` with rounding |
+| Authorization | None | Check business ownership |
+| Delete | Hard delete | Soft delete with audit |
+| Download response | Raw bytes | ResponseEntity with headers |
+| List | All at once | Paginated |
+| Date | String | LocalDate |
+
+</details>
+

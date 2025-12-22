@@ -392,3 +392,249 @@ Think about:
 
 </details>
 
+---
+
+## ✅ Fixed Code Solution
+
+<details>
+<summary>Click to reveal the corrected implementation</summary>
+
+### Fixed Audit Controller
+
+```java
+package com.bank.audit;
+
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.*;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.*;
+import java.util.*;
+
+/**
+ * Audit log controller.
+ * 
+ * IMPORTANT COMPLIANCE NOTES:
+ * - Audit logs are IMMUTABLE - no update or delete endpoints
+ * - Access restricted to COMPLIANCE_OFFICER role
+ * - All access to audit logs is itself audited
+ */
+@RestController
+@RequestMapping("/api/v1/audit")
+@PreAuthorize("hasRole('COMPLIANCE_OFFICER')")  // FIX: All endpoints require compliance role
+public class AuditController {
+
+    private static final Logger logger = LoggerFactory.getLogger(AuditController.class);
+
+    private final AuditRepository auditRepository;
+    private final AuditService auditService;  // FIX: Internal service for creating logs
+
+    // Constructor injection...
+
+    // FIX: REMOVED @PostMapping("/log") - audit logs created internally only
+    // Audit entries are created by AuditService internally, not via public API
+
+    @GetMapping("/search")
+    public ResponseEntity<Page<AuditEntryResponse>> searchAuditLogs(
+            @RequestParam(required = false) String userId,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate startDate,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate endDate,
+            @RequestParam(required = false) String action,
+            @RequestParam(required = false) String resourceType,
+            Pageable pageable) {  // FIX: Paginated
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        // FIX: Audit the access to audit logs
+        auditService.logInternally(AuditEntry.builder()
+            .action("AUDIT_LOG_SEARCH")
+            .userId(currentUserId)
+            .details("Search params: userId=" + userId + ", dates=" + startDate + "-" + endDate)
+            .timestamp(Instant.now())
+            .ipAddress(SecurityContext.getRemoteAddr())  // FIX: Get IP from request
+            .build());
+
+        Page<AuditEntry> results = auditRepository.searchLogs(
+            userId, startDate, endDate, action, resourceType, pageable
+        );
+
+        // FIX: Return DTO (not raw entities)
+        return ResponseEntity.ok(results.map(this::toResponse));
+    }
+
+    @GetMapping("/export")
+    public ResponseEntity<byte[]> exportLogs(
+            @RequestParam(required = false) String userId,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate startDate,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate endDate,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10000") @Max(50000) int size) {
+
+        String currentUserId = SecurityContext.getCurrentUserId();
+
+        // FIX: Audit the export
+        auditService.logInternally(AuditEntry.builder()
+            .action("AUDIT_LOG_EXPORT")
+            .userId(currentUserId)
+            .details("Export params: userId=" + userId + ", dates=" + startDate + "-" + endDate)
+            .timestamp(Instant.now())
+            .build());
+
+        // FIX: Regular users can only export their own logs
+        // Compliance can export any user's logs
+        String targetUserId = SecurityContext.hasRole("COMPLIANCE_ADMIN") ? userId : currentUserId;
+
+        Page<AuditEntry> logs = auditRepository.findByUserIdAndDateBetween(
+            targetUserId, startDate, endDate, PageRequest.of(page, size)
+        );
+
+        byte[] csvData = generateCsv(logs.getContent());
+
+        // FIX: Proper headers
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.parseMediaType("text/csv"));
+        headers.setContentDisposition(ContentDisposition.attachment()
+            .filename("audit-log-" + startDate + "-" + endDate + ".csv")
+            .build());
+
+        return new ResponseEntity<>(csvData, headers, HttpStatus.OK);
+    }
+
+    // FIX: REMOVED @DeleteMapping("/{entryId}")
+    // FIX: REMOVED @PutMapping("/modify/{entryId}")
+    // FIX: REMOVED @PostMapping("/bulk-delete")
+    // Audit logs are IMMUTABLE - they can never be modified or deleted
+
+    @GetMapping("/retention-policy")
+    public ResponseEntity<RetentionPolicyResponse> getRetentionPolicy() {
+        // Return retention policy info (read-only)
+        return ResponseEntity.ok(new RetentionPolicyResponse(
+            7,  // Years to retain
+            "Archive to cold storage after 2 years",
+            "Regulatory requirement: SOX, GDPR"
+        ));
+    }
+
+    private byte[] generateCsv(List<AuditEntry> logs) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Timestamp,UserId,Action,ResourceType,ResourceId,Details,IpAddress\n");
+
+        for (AuditEntry log : logs) {
+            // FIX: Escape CSV fields to prevent injection
+            sb.append(escapeCsv(log.getTimestamp().toString())).append(",");
+            sb.append(escapeCsv(log.getUserId())).append(",");
+            sb.append(escapeCsv(log.getAction())).append(",");
+            sb.append(escapeCsv(log.getResourceType())).append(",");
+            sb.append(escapeCsv(log.getResourceId())).append(",");
+            sb.append(escapeCsv(log.getDetails())).append(",");
+            sb.append(escapeCsv(log.getIpAddress())).append("\n");
+        }
+
+        return sb.toString().getBytes();
+    }
+
+    // FIX: Prevent CSV injection
+    private String escapeCsv(String value) {
+        if (value == null) return "";
+        
+        // Remove dangerous characters that could execute formulas in Excel
+        String safe = value;
+        if (safe.startsWith("=") || safe.startsWith("+") || 
+            safe.startsWith("-") || safe.startsWith("@")) {
+            safe = "'" + safe;  // Prefix with single quote
+        }
+        
+        // Escape quotes and wrap in quotes if needed
+        if (safe.contains(",") || safe.contains("\"") || safe.contains("\n")) {
+            safe = "\"" + safe.replace("\"", "\"\"") + "\"";
+        }
+        
+        return safe;
+    }
+
+    private AuditEntryResponse toResponse(AuditEntry entry) {
+        return new AuditEntryResponse(
+            entry.getId(),
+            entry.getUserId(),
+            entry.getAction(),
+            entry.getResourceType(),
+            entry.getResourceId(),
+            entry.getDetails(),
+            entry.getTimestamp()
+            // NO modification timestamps since not allowed
+        );
+    }
+}
+```
+
+### Audit Service (Internal Only)
+
+```java
+@Service
+public class AuditService {
+
+    private final AuditRepository auditRepository;
+
+    /**
+     * Log audit entry - INTERNAL USE ONLY.
+     * This is NOT exposed as a public API.
+     */
+    public void logInternally(AuditEntry entry) {
+        entry.setId(UUID.randomUUID().toString());
+        entry.setTimestamp(Instant.now());
+        
+        // FIX: Get IP from security context, not from client
+        if (entry.getIpAddress() == null) {
+            entry.setIpAddress(SecurityContext.getRemoteAddr());
+        }
+        
+        // FIX: Get userId from security context, not from client
+        if (entry.getUserId() == null) {
+            entry.setUserId(SecurityContext.getCurrentUserId());
+        }
+
+        auditRepository.save(entry);
+    }
+
+    // Called from other services when actions occur
+    public void logAction(String action, String resourceType, String resourceId, String details) {
+        logInternally(AuditEntry.builder()
+            .action(action)
+            .resourceType(resourceType)
+            .resourceId(resourceId)
+            .details(details)
+            .build());
+    }
+}
+```
+
+### Key Fixes Summary (COMPLIANCE CRITICAL)
+
+| Issue | Original | Fixed |
+|-------|----------|-------|
+| Modify endpoint | `@PutMapping("/modify")` | **REMOVED** - Audit logs are immutable |
+| Delete endpoint | `@DeleteMapping`, `bulk-delete` | **REMOVED** - Never delete audit logs |
+| `bypassRetention` | Client parameter | **REMOVED** |
+| Public log creation | `@PostMapping("/log")` | Internal service only |
+| `allUsers` | Client parameter | Role-based access control |
+| `ipAddress` | Client input | Get from request context |
+| CSV injection | Raw value output | Escape dangerous characters |
+| Authorization | None | `@PreAuthorize("hasRole('COMPLIANCE_OFFICER')")` |
+| Audit of audit access | None | Log all searches and exports |
+
+### Compliance Requirements Met
+
+- ✅ **WORM**: Write-Once, Read-Many (no updates or deletes)
+- ✅ **Retention**: No deletion capability
+- ✅ **Access Control**: Restricted to compliance officers
+- ✅ **Audit Trail**: Access to audit logs is itself audited
+- ✅ **Data Integrity**: No modification endpoints
+
+</details>
+
