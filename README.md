@@ -45,6 +45,14 @@ tide-interview-prep/
 │   ├── BEHAVIORAL_QUESTIONS.md        # 🆕 Behavioral Q&A prep
 │   └── QUESTIONS_TO_ASK.md            # 🆕 Questions for hiring manager
 │
+├── prep-manager-round/                # 🆕 Hiring Manager Round preparation
+│   ├── README.md                      # Study plan and overview
+│   ├── TIDE_LOAN_REPAYMENT_DEEP_DIVE.md
+│   ├── TIDE_LOAN_REPAYMENT_QUICK_REF.md
+│   ├── TIDE_INTERVIEW_STRATEGY.md
+│   ├── TIDE_GENERAL_INTERVIEW_TOPICS.md
+│   └── TIDE_*.md                      # Additional preparation materials
+│
 ├── practice/                          # Code review practice problems
 │   ├── README.md
 │   └── PRACTICE_PROBLEM_*.md          # 14 practice problems with solutions
@@ -95,7 +103,12 @@ tide-interview-prep/
 - [Practice Problems](practice/README.md) - 14 problems with solutions
 
 ### Hiring Manager Round (Current Focus 📝)
-- [Complete Preparation Guide](docs/HIRING_MANAGER_PREP.md) - **Start here!**
+- **[📁 Complete Preparation Materials](prep-manager-round/)** - **Start here!** 🆕
+  - [Loan Repayment Deep Dive](prep-manager-round/TIDE_LOAN_REPAYMENT_DEEP_DIVE.md) - Primary project guide
+  - [Quick Reference Card](prep-manager-round/TIDE_LOAN_REPAYMENT_QUICK_REF.md) - Last-minute revision
+  - [Interview Strategy](prep-manager-round/TIDE_INTERVIEW_STRATEGY.md) - Presentation framework
+  - [General Topics](prep-manager-round/TIDE_GENERAL_INTERVIEW_TOPICS.md) - System design, transactions, security
+- [Complete Preparation Guide](docs/HIRING_MANAGER_PREP.md) - Alternative guide
 - [Project Discussion Framework](docs/PROJECT_DISCUSSION_FRAMEWORK.md) - STAR method
 - [Technical Deep-Dive](docs/TECHNICAL_DEEP_DIVE.md) - System design, security, transactions
 - [Behavioral Questions](docs/BEHAVIORAL_QUESTIONS.md) - Common Q&A
@@ -128,7 +141,14 @@ tide-interview-prep/
 
 ## 🎯 Hiring Manager Round - Quick Start
 
-**Priority Reading Order**:
+**Priority Reading Order** (New Materials):
+1. **[prep-manager-round/README.md](prep-manager-round/README.md)** - Complete overview & study plan 🆕
+2. [Loan Repayment Deep Dive](prep-manager-round/TIDE_LOAN_REPAYMENT_DEEP_DIVE.md) - Primary project focus 🆕
+3. [General Topics Guide](prep-manager-round/TIDE_GENERAL_INTERVIEW_TOPICS.md) - System design, transactions, security 🆕
+4. [Interview Strategy](prep-manager-round/TIDE_INTERVIEW_STRATEGY.md) - Presentation framework 🆕
+5. [Quick Reference](prep-manager-round/TIDE_LOAN_REPAYMENT_QUICK_REF.md) - Last-minute revision 🆕
+
+**Alternative Materials** (in docs folder):
 1. [HIRING_MANAGER_PREP.md](docs/HIRING_MANAGER_PREP.md) - Complete overview
 2. [PROJECT_DISCUSSION_FRAMEWORK.md](docs/PROJECT_DISCUSSION_FRAMEWORK.md) - Structure your project stories
 3. [TECHNICAL_DEEP_DIVE.md](docs/TECHNICAL_DEEP_DIVE.md) - Brush up on technical concepts
