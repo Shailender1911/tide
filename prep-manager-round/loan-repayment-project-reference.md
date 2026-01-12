@@ -14,10 +14,11 @@
 4. [Roadblocks & How You Overcame Them](#roadblocks--how-you-overcame-them)
 5. [Deployment Strategies](#deployment-strategies)
 6. [Testing Strategy](#testing-strategy)
-7. [Conflict Resolution Examples](#conflict-resolution-examples)
-8. [Why Tide & Why Change](#why-tide--why-change)
-9. [STAR Method Examples](#star-method-examples)
-10. [Key Talking Points](#key-talking-points)
+7. [Production Observability Stack](#production-observability-stack)
+8. [Conflict Resolution Examples](#conflict-resolution-examples)
+9. [Why Tide & Why Change](#why-tide--why-change)
+10. [STAR Method Examples](#star-method-examples)
+11. [Key Talking Points](#key-talking-points)
 
 ---
 
