@@ -326,7 +326,7 @@ public ResponseEntity<RepaymentResponse> processRepayment(
             .message("Processing asynchronously")
             .build());
 }
-```"
+```
 
 #### **Result (R)**
 
@@ -415,7 +415,7 @@ private GetLoanResponse getLoanDetailsFromFinflux(
         throw new LMSException("Failed to fetch loan", e);
     }
 }
-```"
+```
 
 #### **Outcome**
 
@@ -466,7 +466,7 @@ public void processWebhook(PayoutVaDepositRequest request) {
     // Process payment
     processPayment(request);
 }
-```"
+```
 
 #### **Outcome**
 
