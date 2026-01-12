@@ -3,8 +3,8 @@
 
 **Experience**: 5+ Years (3.8 Years at PayU)  
 **Primary Focus**: Loan Repayment Service (LRS)  
-**Supporting Projects**: Orchestration Service, ZipCredit  
-**Tech Stack**: Java 17, Spring Boot 3, MySQL, Redis, Kafka, AWS
+**Supporting Projects**: Orchestration Service, ZipCredit, ConfigNexus  
+**Tech Stack**: Java 17, Spring Boot 3, MySQL, Redis, Kafka, AWS, React, Python
 
 ---
 
@@ -12,14 +12,15 @@
 
 1. [About Me - Detailed Introduction](#about-me---detailed-introduction)
 2. [AI Skills & Productivity Tools](#ai-skills--productivity-tools)
-3. [Loan Repayment Service - Deep Dive](#loan-repayment-service---deep-dive)
-4. [Technical Deep Dives with Cross Questions](#technical-deep-dives-with-cross-questions)
-5. [Cron Jobs - Detailed Analysis](#cron-jobs---detailed-analysis)
-6. [Connection Pooling - Complete Guide](#connection-pooling---complete-guide)
-7. [Java 17 & Spring Boot 3 Migration](#java-17--spring-boot-3-migration)
-8. [Other Service Contributions](#other-service-contributions)
-9. [Anticipated Cross Questions](#anticipated-cross-questions)
-10. [Tech Stack Reference](#tech-stack-reference)
+3. [ConfigNexus - Full Stack Project](#confignexus---full-stack-project)
+4. [Loan Repayment Service - Deep Dive](#loan-repayment-service---deep-dive)
+5. [Technical Deep Dives with Cross Questions](#technical-deep-dives-with-cross-questions)
+6. [Cron Jobs - Detailed Analysis](#cron-jobs---detailed-analysis)
+7. [Connection Pooling - Complete Guide](#connection-pooling---complete-guide)
+8. [Java 17 & Spring Boot 3 Migration](#java-17--spring-boot-3-migration)
+9. [Other Service Contributions](#other-service-contributions)
+10. [Anticipated Cross Questions](#anticipated-cross-questions)
+11. [Tech Stack Reference](#tech-stack-reference)
 
 ---
 
@@ -36,7 +37,8 @@
 > - **Async Processing Architecture** that improved API response times by 20x
 > - **Webhook Retry Mechanism** with exponential backoff achieving 99%+ success rate
 >
-> Beyond traditional development, I've been actively leveraging **AI tools like Cursor AI** to enhance my productivity and learning. I've built several automation tools including:
+> Beyond traditional development, I've been actively leveraging **AI tools like Cursor AI** to enhance my productivity and learning. I've built several automation tools and a complete full-stack application:
+> - **ConfigNexus** - A multi-tenant configuration management platform (Backend + Frontend + MCP Server)
 > - **Production Debugging System** that reduced investigation time from 2-4 hours to 15-30 minutes
 > - **Automated Code Review System** using GitLab MCP integration
 > - **JIRA Analysis Automation** for faster ticket understanding and development planning
@@ -146,6 +148,413 @@ Result: Ticket analysis time reduced from hours to minutes
 > 4. **Knowledge Sharing**: I've created comprehensive documentation and guides using AI, making it easier for team members to onboard and understand our systems.
 >
 > 5. **Continuous Learning**: AI helps me stay updated with best practices and new technologies. I can quickly explore 'what if' scenarios and learn from the responses."
+
+---
+
+## 🔧 ConfigNexus - Full Stack Project
+
+### **Project Overview**
+
+> "ConfigNexus is a **multi-tenant configuration management platform** that I built from scratch using AI-assisted development. It's a complete full-stack application with a Spring Boot backend, React frontend, and a custom MCP server for AI integration."
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        ConfigNexus Platform                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │   React Frontend │  │  Spring Boot     │  │   MCP Server     │  │
+│  │   (Dashboard)    │◄─┤  Backend API     │◄─┤  (Python)        │  │
+│  │   Port: 5173     │  │  Port: 8090      │  │  Port: 7075      │  │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
+│          │                     │                     │              │
+│          │                     │                     │              │
+│          └─────────────────────┴─────────────────────┘              │
+│                                │                                     │
+│         ┌──────────────────────┼──────────────────────┐            │
+│         │                      │                      │             │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐         │
+│  │   MySQL      │    │ SSH Tunnel   │    │   GitLab     │         │
+│  │   Database   │    │ Manager      │    │   API        │         │
+│  └──────────────┘    └──────────────┘    └──────────────┘         │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### **Why I Built ConfigNexus**
+
+> "At PayU, we manage configurations across multiple tenants (SMB, LazyPay, PayU Finance) and services (ZipCredit, Loan Repayment, Orchestration). Configuration changes were:
+> - **Error-prone**: Manual database updates
+> - **Untracked**: No audit trail
+> - **Risky**: No approval workflow
+> - **Slow**: Required DBA involvement
+>
+> ConfigNexus solves all these problems with a centralized, audited, workflow-driven configuration management system."
+
+### **Key Features**
+
+| Feature | Description | Technical Implementation |
+|---------|-------------|-------------------------|
+| **Multi-Tenancy** | Complete data isolation per tenant | Tenant-scoped queries, JWT with tenant claims |
+| **Change Request Workflow** | 3-level approval (Editor → Reviewer → Admin) | State machine, audit trail |
+| **Version Control** | Complete history with rollback | Versioned configs, diff comparison |
+| **Dynamic DB Connections** | Connect to tenant-specific databases | SSH tunneling, dynamic DataSource |
+| **Microsoft SSO** | Azure AD single sign-on | MSAL.js, JWT validation |
+| **MCP Integration** | AI assistant integration | Custom MCP server with 32 tools |
+
+### **Tech Stack**
+
+#### **Backend (central-config-manager)**
+
+| Technology | Version | Purpose |
+|------------|---------|---------|
+| **Java** | 17 | Primary language |
+| **Spring Boot** | 3.2.0 | Application framework |
+| **Spring Security** | 6.x | Authentication & Authorization |
+| **Spring Data JPA** | 3.x | Data access layer |
+| **MySQL** | 8.0 | Primary database |
+| **Flyway** | 9.x | Database migrations |
+| **JSch** | 0.1.55 | SSH tunneling |
+| **JWT** | 0.11.5 | Token-based auth |
+
+#### **Frontend (config-manager-dashboard)**
+
+| Technology | Version | Purpose |
+|------------|---------|---------|
+| **React** | 18.x | UI framework |
+| **Vite** | 5.x | Build tool |
+| **Tailwind CSS** | 3.x | Styling |
+| **React Router** | 6.x | Navigation |
+| **MSAL.js** | 2.x | Microsoft SSO |
+| **Axios** | 1.x | HTTP client |
+
+#### **MCP Server (config-nexus-mcp)**
+
+| Technology | Version | Purpose |
+|------------|---------|---------|
+| **Python** | 3.9 | Primary language |
+| **FastAPI** | 0.104.x | HTTP server |
+| **aiomysql** | 0.2.x | Async MySQL |
+| **httpx** | 0.25.x | HTTP client |
+| **Cloudflare Tunnel** | - | Secure external access |
+
+### **Architecture Deep Dive**
+
+#### **1. Multi-Tenant Architecture**
+
+```java
+// TenantContext - ThreadLocal tenant isolation
+public class TenantContext {
+    private static final ThreadLocal<String> currentTenant = new ThreadLocal<>();
+    
+    public static void setCurrentTenant(String tenantId) {
+        currentTenant.set(tenantId);
+    }
+    
+    public static String getCurrentTenant() {
+        return currentTenant.get();
+    }
+}
+
+// TenantFilter - Extract tenant from JWT
+@Component
+public class TenantFilter extends OncePerRequestFilter {
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, 
+                                    HttpServletResponse response, 
+                                    FilterChain chain) {
+        String tenantId = extractTenantFromToken(request);
+        TenantContext.setCurrentTenant(tenantId);
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            TenantContext.clear();
+        }
+    }
+}
+```
+
+#### **2. Change Request Workflow**
+
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   DRAFT     │───►│  SUBMITTED  │───►│  APPROVED   │───►│  DEPLOYED   │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+      │                  │                  │                  │
+      │                  │                  │                  │
+      ▼                  ▼                  ▼                  ▼
+   Editor            Reviewer            Admin            System
+   Creates           Reviews &           Approves &       Auto-deploys
+   CR                Comments            Deploys          to DB
+```
+
+**Implementation:**
+```java
+@Service
+public class ChangeRequestService {
+    
+    public ChangeRequest submitForReview(Long crId) {
+        ChangeRequest cr = findById(crId);
+        validateState(cr, CRStatus.DRAFT);
+        cr.setStatus(CRStatus.SUBMITTED);
+        cr.setSubmittedAt(LocalDateTime.now());
+        auditService.log(cr, "SUBMITTED", getCurrentUser());
+        return save(cr);
+    }
+    
+    public ChangeRequest approve(Long crId, String comment) {
+        ChangeRequest cr = findById(crId);
+        validateState(cr, CRStatus.SUBMITTED);
+        validateApprover(cr, getCurrentUser());
+        
+        cr.setStatus(CRStatus.APPROVED);
+        cr.setApprovedAt(LocalDateTime.now());
+        cr.setApprovedBy(getCurrentUser());
+        
+        // Auto-deploy to target database
+        deployConfig(cr);
+        
+        auditService.log(cr, "APPROVED", getCurrentUser());
+        return save(cr);
+    }
+}
+```
+
+#### **3. Dynamic Database Connections with SSH Tunneling**
+
+```java
+@Service
+public class DynamicDataSourceService {
+    
+    @Autowired
+    private SSHTunnelManager sshTunnelManager;
+    
+    public Connection getConnection(TenantDatabase config) {
+        // 1. Create SSH tunnel if needed
+        if (config.requiresSSH()) {
+            int localPort = sshTunnelManager.createTunnel(
+                config.getBastionHost(),
+                config.getDbHost(),
+                config.getDbPort()
+            );
+            config.setLocalPort(localPort);
+        }
+        
+        // 2. Create connection through tunnel
+        String url = String.format(
+            "jdbc:mysql://localhost:%d/%s",
+            config.getLocalPort(),
+            config.getDatabase()
+        );
+        
+        return DriverManager.getConnection(url, 
+            config.getUsername(), 
+            config.getPassword());
+    }
+}
+
+// SSH Tunnel Manager using JSch
+@Component
+public class SSHTunnelManager {
+    
+    private final Map<String, Session> activeSessions = new ConcurrentHashMap<>();
+    
+    public int createTunnel(String bastionHost, String targetHost, int targetPort) {
+        JSch jsch = new JSch();
+        jsch.addIdentity(privateKeyPath);
+        
+        Session session = jsch.getSession(user, bastionHost, 22);
+        session.setConfig("StrictHostKeyChecking", "no");
+        session.connect();
+        
+        int localPort = session.setPortForwardingL(0, targetHost, targetPort);
+        activeSessions.put(bastionHost + ":" + targetHost, session);
+        
+        return localPort;
+    }
+}
+```
+
+#### **4. MCP Server - AI Integration**
+
+```python
+# ConfigNexus MCP Server - 32 Tools for AI Integration
+
+from fastapi import FastAPI
+from typing import Dict, Any
+
+app = FastAPI()
+
+# Tool Categories:
+# - Configuration Tools (2): search_configs, get_config
+# - Partner Management (2): list_partners, get_partner
+# - Change Requests (2): list_change_requests, get_change_request
+# - Tenant & Service (2): list_tenants, list_services
+# - Database (2): database_query, database_schema
+# - GitLab Integration (5): git_list_branches, git_search_code, etc.
+# - Enhanced Tools (10): compare_configs, config_history, etc.
+# - GitLab MR Tools (5): list_gitlab_mrs, get_gitlab_mr, etc.
+# - Advanced Search (2): search_configs_advanced, filter_gitlab_mrs
+
+@app.post("/tools/search_configs")
+async def search_configs(query: str, tenant: str = None) -> Dict[str, Any]:
+    """Search configurations across all tables"""
+    results = await config_service.search(query, tenant)
+    return {"configs": results, "count": len(results)}
+
+@app.post("/tools/get_cr_impact_analysis")
+async def get_cr_impact_analysis(cr_id: str) -> Dict[str, Any]:
+    """Analyze impact of a change request"""
+    cr = await cr_service.get(cr_id)
+    impact = await analyze_impact(cr)
+    return {
+        "change_request": cr,
+        "affected_services": impact.services,
+        "risk_level": impact.risk,
+        "recommendations": impact.recommendations
+    }
+```
+
+### **Key Achievements**
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| **Config Change Time** | 2-4 hours (DBA involved) | 15-30 minutes | 85% faster |
+| **Error Rate** | 5-10% (manual errors) | <1% (validated) | 90% reduction |
+| **Audit Compliance** | None | 100% tracked | Full compliance |
+| **Rollback Time** | 1-2 hours | 2 minutes | 98% faster |
+| **AI Query Response** | N/A | <2 seconds | New capability |
+
+### **Cross Questions & Answers**
+
+**Q1: Why did you build this from scratch instead of using existing tools like Spring Cloud Config?**
+
+> "Good question. I evaluated several options:
+>
+> **Spring Cloud Config:**
+> - Pros: Mature, well-documented
+> - Cons: File-based (Git), no UI, no approval workflow, no multi-tenant support
+>
+> **HashiCorp Consul:**
+> - Pros: Distributed, key-value store
+> - Cons: No approval workflow, complex setup, no audit trail
+>
+> **ConfigNexus (Custom):**
+> - Multi-tenant from ground up
+> - 3-level approval workflow
+> - Complete audit trail
+> - Dynamic database connections
+> - AI integration via MCP
+>
+> The key differentiator is the **approval workflow** and **multi-tenant isolation** which are critical for our compliance requirements."
+
+**Q2: How does the MCP server work? Why did you build it?**
+
+> "MCP (Model Context Protocol) is Anthropic's protocol for AI tool integration.
+>
+> **Why I built it:**
+> 1. **Natural Language Queries**: Ask 'What configs changed for Meesho last week?'
+> 2. **Cross-System Search**: Search configs, CRs, and code in one query
+> 3. **Impact Analysis**: AI can analyze CR impact before approval
+> 4. **Productivity**: Developers can query configs without leaving their IDE
+>
+> **How it works:**
+> 1. AI assistant (Cursor/Claude) sends tool request
+> 2. MCP server receives via HTTP/Cloudflare tunnel
+> 3. Server executes query against ConfigNexus API or database
+> 4. Results returned to AI for natural language response
+>
+> **32 tools** covering configs, CRs, database queries, GitLab integration, and more."
+
+**Q3: How do you handle security for dynamic database connections?**
+
+> "Multiple layers:
+>
+> 1. **SSH Tunneling**: All connections go through bastion host
+> 2. **Credential Encryption**: Database passwords encrypted with KMS
+> 3. **Read-Only Access**: MCP server has read-only database access
+> 4. **Audit Logging**: All queries logged with user context
+> 5. **Token Validation**: JWT tokens validated on every request
+> 6. **Tenant Isolation**: Users can only access their tenant's data"
+
+**Q4: What was the biggest challenge in building ConfigNexus?**
+
+> "The **dynamic database connection with SSH tunneling** was the most challenging:
+>
+> **Challenges:**
+> 1. Managing SSH session lifecycle
+> 2. Handling connection timeouts
+> 3. Port forwarding conflicts
+> 4. Connection pooling through tunnels
+>
+> **Solution:**
+> - Used JSch library for SSH
+> - Implemented session caching
+> - Added health checks for tunnels
+> - Graceful reconnection on failure
+>
+> **Lesson Learned:**
+> - Always have fallback mechanisms
+> - Monitor tunnel health actively
+> - Set appropriate timeouts"
+
+**Q5: How long did it take to build ConfigNexus?**
+
+> "Approximately **2-3 weeks** with AI-assisted development:
+>
+> **Week 1:**
+> - Backend API (Spring Boot 3, Java 17)
+> - Database schema design
+> - Core CRUD operations
+>
+> **Week 2:**
+> - Frontend dashboard (React, Tailwind)
+> - Change request workflow
+> - Microsoft SSO integration
+>
+> **Week 3:**
+> - MCP server (Python, FastAPI)
+> - GitLab integration
+> - Testing and documentation
+>
+> **AI Acceleration:**
+> - Cursor AI helped with boilerplate code
+> - Generated test cases
+> - Created documentation
+> - Debugged complex issues
+>
+> Without AI, this would have taken **2-3 months**."
+
+### **Demo Talking Points**
+
+> "Let me walk you through ConfigNexus:
+>
+> **1. Dashboard Overview**
+> - Multi-tenant selector (SMB, LazyPay, PayU Finance)
+> - Service-wise configuration view
+> - Change request status board
+>
+> **2. Configuration Management**
+> - Search across all config tables
+> - View config history and versions
+> - Compare configurations across environments
+>
+> **3. Change Request Workflow**
+> - Create CR with config changes
+> - Submit for review
+> - Reviewer approves/rejects with comments
+> - Admin deploys to target database
+> - Complete audit trail
+>
+> **4. AI Integration (MCP)**
+> - Ask: 'What configs changed for Meesho last week?'
+> - Ask: 'Show me pending CRs for ZipCredit'
+> - Ask: 'Compare UAT and PROD configs for loan limits'
+>
+> **5. Version Control**
+> - View all versions of a config
+> - Compare any two versions
+> - One-click rollback to previous version"
 
 ---
 
@@ -1392,6 +1801,20 @@ Architecture: Monolithic (Legacy)
 | **LRS** | 11 | 2.7.x | MySQL (Master-Slave) | Redis | - |
 | **Orchestration** | 8→17 | 2.x→3.x | MySQL | Redis | - |
 | **ZipCredit** | 8 | 2.x | MySQL | Redis | Kafka |
+| **ConfigNexus** | 17 | 3.2.x | MySQL | - | - |
+
+### **ConfigNexus (Full Stack)**
+
+| Component | Technology | Version | Purpose |
+|-----------|------------|---------|---------|
+| **Backend** | Java + Spring Boot | 17 + 3.2.0 | REST API, Business Logic |
+| **Frontend** | React + Vite | 18.x + 5.x | Dashboard UI |
+| **MCP Server** | Python + FastAPI | 3.9 + 0.104.x | AI Integration |
+| **Database** | MySQL | 8.0 | Primary storage |
+| **Auth** | MSAL.js + JWT | 2.x | Microsoft SSO |
+| **Styling** | Tailwind CSS | 3.x | UI styling |
+| **SSH** | JSch | 0.1.55 | Tunnel management |
+| **Tunnel** | Cloudflare | - | External access |
 
 ---
 
