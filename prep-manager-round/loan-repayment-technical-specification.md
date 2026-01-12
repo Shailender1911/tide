@@ -873,6 +873,205 @@ Developer → Tech Lead → Engineering Manager → CTO
 
 ## 📈 Monitoring, Alerting & Tracing
 
+### **Three-Tier Observability Stack**
+
+We use a comprehensive observability architecture with three complementary tools:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  PRODUCTION OBSERVABILITY STACK                             │
+├────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. Kibana (ELK Stack)                                      │
+│     URL: payufin-prod-kibana.payufin.io                    │
+│     ├── 29+ million log hits daily                         │
+│     ├── Kubernetes pod logs                                │
+│     ├── KQL-based search and filtering                      │
+│     └── Real-time log streaming                            │
+│                                                              │
+│  2. SigNoz (Distributed Tracing)                            │
+│     URL: payuwibmo-signoz.payufin.in                       │
+│     ├── End-to-end request tracing                          │
+│     ├── Service dependency mapping                          │
+│     ├── Performance bottleneck identification               │
+│     └── Error rate tracking (2% error rate)                 │
+│                                                              │
+│  3. Coralogix (APM & Analytics)                            │
+│     URL: payu-apm.app.coralogix.in                          │
+│     ├── 10.45M traces in 15 minutes                        │
+│     ├── AI-powered anomaly detection                        │
+│     ├── Service-level performance metrics                   │
+│     └── Advanced error pattern analysis                    │
+│                                                              │
+└────────────────────────────────────────────────────────────┘
+```
+
+### **1. Kibana (ELK Stack) - Log Analysis**
+
+**Production URL**: [https://payufin-prod-kibana.payufin.io/app/discover](https://payufin-prod-kibana.payufin.io/app/discover)
+
+#### **Configuration**
+
+- **Index Pattern**: `prod-k8s-logs-ams-nbfc-server`
+- **Log Volume**: 29,431,466 hits in 24 hours
+- **Time Range**: Real-time + historical (30 days retention)
+- **Collection**: Kubernetes pod logs via Filebeat/Logstash
+
+#### **Key Capabilities**
+
+**Log Search & Filtering:**
+```kql
+# Production debugging queries
+application_id: "APP12345" AND level: "ERROR"
+duration: >1000 AND operation: "SELECT"
+message: "webhook" AND status: "FAILED"
+kubernetes.deployment.name: "loan-repayment"
+```
+
+**Use Cases:**
+- Production issue debugging by application_id/transaction_id
+- Error pattern analysis
+- Traffic pattern visualization
+- Container-level log analysis
+
+**Real Example:**
+> "When debugging a repayment failure, I search Kibana:
+> 1. Filter: `application_id: "APP12345"` AND `@timestamp: [last 1 hour]`
+> 2. Filter: `level: "ERROR"` or `level: "WARN"`
+> 3. Analyze: Error messages, stack traces, request context
+> 4. Trace: Correlation IDs across services
+> 
+> This gives me complete context of what happened, when, and why."
+
+### **2. SigNoz - Distributed Tracing**
+
+**Production URL**: [https://payuwibmo-signoz.payufin.in/trace](https://payuwibmo-signoz.payufin.in/trace)
+
+#### **Services Monitored**
+
+- **prod-lrs** (Loan Repayment Service)
+- **prod-orch** (Orchestration Service)
+- **prod-zc** (ZipCredit Service)
+- **Prod_Lending**, **Prod_Neo-admin**, **Prod_Neo-merchant**
+- **mysql**, **redis**, **route**, **customer**, **driver**
+
+#### **Key Metrics**
+
+- **Total Traces**: 1M+ in time window
+- **Error Rate**: 22,553 errors / 1,070,487 successful (~2%)
+- **Duration Range**: 0ms to 343s
+- **Service Dependencies**: Visual service map
+
+#### **Trace Examples**
+
+```
+Example 1: Successful Request
+prod-orch → GET /orchestration/v1/gpay/application/status
+Duration: 64.34 ms
+Status: ok
+
+Example 2: Database Query
+prod-lrs → SELECT loan_repayment.payout_credit_info
+Duration: 0.84 ms
+Status: ok
+
+Example 3: Repository Call
+prod-lrs → PayoutCreditInfoRepository.findByApplicationIdAndExternalReferenceNumber
+Duration: 1.00 ms
+Status: ok
+```
+
+#### **Use Cases**
+
+- **Performance Analysis**: Identify slow operations
+- **Error Tracking**: Filter by `status: error`
+- **Service Dependencies**: Understand microservice interactions
+- **Bottleneck Identification**: Find slowest operations
+
+**Real Example:**
+> "SigNoz helped identify a performance bottleneck:
+> - Found: Database query taking 5 seconds
+> - Service: prod-lrs
+> - Operation: SELECT loan_repayment.payout_credit_info
+> - Root Cause: Missing index on application_id
+> - Fix: Added index, query time reduced to 0.84ms"
+
+### **3. Coralogix - APM & Advanced Analytics**
+
+**Production URL**: [https://payu-apm.app.coralogix.in/#/query-new/tracing](https://payu-apm.app.coralogix.in/#/query-new/tracing)
+
+#### **Scale & Metrics**
+
+- **Trace Volume**: 10.45 million traces in 15 minutes
+- **Applications**: 
+  - default: 9.73M traces
+  - smb-lending: 614K traces
+  - otel: 103K traces
+
+#### **Performance Graphs**
+
+**1. Max Duration by Action:**
+- POST Execute prepar...: 415s (peak)
+- POST /v0/bbps...: 200s
+- SELECT L:11 4-: 100s
+
+**2. Spans per Service:**
+- billpayments: 138K spans (peak)
+- shylock_prod: 80K spans
+- webapp-gravit: 50K spans
+
+**3. Errors per Service:**
+- secureapp-gra: 4.19K errors (peak)
+- webapp-gravit: 2K errors
+- sauron_gravito: 1.5K errors
+
+#### **Advanced Features**
+
+- **AI-Powered Anomaly Detection**: Automatic issue identification
+- **Latency Percentile Analysis**: P50, P95, P99 tracking
+- **Error Pattern Analysis**: Group errors by type
+- **Service Health Monitoring**: Real-time service status
+
+**Real Example:**
+> "Coralogix alerted us to a production issue:
+> - Alert: Error spike in secureapp-gravit (4.19K errors)
+> - Time: Peak hours (23:35)
+> - Correlation: Performance degradation at same time
+> - Root Cause: Database connection pool exhaustion
+> - Solution: Increased pool size, added read replicas
+> - Result: Error rate dropped, performance improved"
+
+### **Integrated Debugging Workflow**
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  PRODUCTION DEBUGGING WORKFLOW                              │
+├────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. Alert Triggered                                         │
+│     ↓ Coralogix: Error rate spike detected                  │
+│                                                              │
+│  2. Identify Affected Service                               │
+│     ↓ Coralogix: prod-lrs service showing errors           │
+│                                                              │
+│  3. Trace Request Flow                                      │
+│     ↓ SigNoz: Filter by service, status=error              │
+│     ↓ Identify: Operation failing, duration                │
+│                                                              │
+│  4. Detailed Log Analysis                                   │
+│     ↓ Kibana: Search by application_id, error level        │
+│     ↓ Analyze: Error messages, stack traces                │
+│                                                              │
+│  5. Root Cause Identified                                   │
+│     ↓ Example: LMS API timeout                             │
+│                                                              │
+│  6. Fix & Verify                                            │
+│     ↓ Implement: Retry mechanism                           │
+│     ↓ Monitor: All three tools for verification            │
+│                                                              │
+└────────────────────────────────────────────────────────────┘
+```
+
 ### **Monitoring Stack**
 
 #### **1. Application Metrics (Prometheus)**

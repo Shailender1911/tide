@@ -848,6 +848,306 @@ Peak Load (500 users):
 
 ---
 
+## 🔍 Production Observability Stack
+
+### **Three-Tier Observability Architecture**
+
+We use a comprehensive observability stack with three complementary tools:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  OBSERVABILITY STACK                                        │
+├────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. Kibana (ELK Stack) - Logs                              │
+│     ├── Centralized log aggregation                        │
+│     ├── 29+ million log hits daily                         │
+│     └── Production Kubernetes logs                         │
+│                                                              │
+│  2. SigNoz - Distributed Tracing                           │
+│     ├── End-to-end request tracing                          │
+│     ├── Service dependency mapping                          │
+│     └── Performance bottleneck identification               │
+│                                                              │
+│  3. Coralogix - APM & Advanced Analytics                   │
+│     ├── Application performance monitoring                  │
+│     ├── Error tracking and analysis                         │
+│     └── Service-level metrics                              │
+│                                                              │
+└────────────────────────────────────────────────────────────┘
+```
+
+### **1. Kibana (ELK Stack) - Log Analysis**
+
+#### **Setup & Configuration**
+
+> "We use **Kibana** for centralized log aggregation and analysis. Our production environment generates **29+ million log entries daily** from Kubernetes pods across all microservices."
+
+**URL**: [https://payufin-prod-kibana.payufin.io/app/discover](https://payufin-prod-kibana.payufin.io/app/discover)
+
+#### **Key Features**
+
+**Log Aggregation:**
+- Centralized logging from all microservices
+- Kubernetes pod logs (`prod-k8s-logs-ams-nbfc-server`)
+- Container-level log collection
+- Real-time log streaming
+
+**Search & Filtering:**
+- KQL (Kibana Query Language) for advanced searches
+- Filter by application_id, transaction_id, error codes
+- Time-range filtering (last 24 hours, custom ranges)
+- Field-level filtering
+
+**Use Cases:**
+
+1. **Production Debugging**
+   ```kql
+   # Find all errors for specific application
+   application_id: "APP12345" AND level: "ERROR"
+   
+   # Find slow queries
+   duration: >1000 AND operation: "SELECT"
+   
+   # Find webhook processing issues
+   message: "webhook" AND status: "FAILED"
+   ```
+
+2. **Traffic Pattern Analysis**
+   - Analyze log volume over time
+   - Identify peak hours
+   - Detect anomalies
+
+3. **Error Tracking**
+   - Filter by error level
+   - Group by error type
+   - Track error trends
+
+#### **Real Example from Production**
+
+> "When debugging a production issue, I use Kibana to:
+> 1. **Search by Application ID**: `application_id: "APP12345"`
+> 2. **Filter by Time Range**: Last 1 hour around the issue time
+> 3. **Look for Errors**: Filter `level: "ERROR"` or `level: "WARN"`
+> 4. **Trace Request Flow**: Search for correlation IDs across services
+> 5. **Analyze Patterns**: Group by error type to identify root cause
+
+> This helps me quickly identify:
+> - Which service failed
+> - What error occurred
+> - When it happened
+> - Request context and payloads"
+
+### **2. SigNoz - Distributed Tracing**
+
+#### **Setup & Configuration**
+
+> "**SigNoz** provides distributed tracing across all our microservices. It shows end-to-end request flows, service dependencies, and performance bottlenecks."
+
+**URL**: [https://payuwibmo-signoz.payufin.in/trace](https://payuwibmo-signoz.payufin.in/trace)
+
+#### **Key Features**
+
+**Service Monitoring:**
+- **prod-lrs** (Loan Repayment Service)
+- **prod-orch** (Orchestration Service)
+- **prod-zc** (ZipCredit Service)
+- **Prod_Lending**, **Prod_Neo-admin**, **Prod_Neo-merchant**
+- **mysql**, **redis**, **route**, **customer**, **driver**
+
+**Trace Analysis:**
+- Duration filtering (0ms to 343s)
+- Status filtering (error vs ok)
+- Service-level filtering
+- Operation-level analysis
+
+**Metrics:**
+- **Error Rate**: 22,553 errors vs 1,070,487 successful operations (~2% error rate)
+- **Trace Volume**: 1M+ traces in time window
+- **Service Dependencies**: Visual service map
+
+#### **Use Cases**
+
+1. **Performance Analysis**
+   ```
+   Example Trace:
+   prod-orch → GET /orchestration/v1/gpay/application/status
+   Duration: 64.34 ms
+   
+   prod-lrs → SELECT loan_repayment.payout_credit_info
+   Duration: 0.84 ms
+   ```
+
+2. **Error Tracking**
+   - Filter by `status: error`
+   - Identify which services are failing
+   - Analyze error patterns
+
+3. **Service Dependency Mapping**
+   - Visualize service interactions
+   - Identify bottlenecks
+   - Understand request flow
+
+#### **Real Example from Production**
+
+> "When investigating a slow API call:
+> 1. **Search in SigNoz**: Filter by service `prod-lrs` and operation
+> 2. **View Trace Details**: See complete request flow across services
+> 3. **Identify Bottleneck**: Found database query taking 5 seconds
+> 4. **Root Cause**: Missing index on `application_id` column
+> 5. **Fix**: Added index, query time reduced to 0.84ms
+
+> SigNoz helps me:
+> - Understand service dependencies
+> - Identify performance bottlenecks
+> - Debug distributed system issues
+> - Monitor error rates per service"
+
+### **3. Coralogix - APM & Advanced Analytics**
+
+#### **Setup & Configuration**
+
+> "**Coralogix** provides advanced APM capabilities with AI-powered insights. It processes **10.45 million traces in 15 minutes**, showing real-time performance metrics."
+
+**URL**: [https://payu-apm.app.coralogix.in/#/query-new/tracing](https://payu-apm.app.coralogix.in/#/query-new/tracing)
+
+#### **Key Features**
+
+**Performance Metrics:**
+- **Max Duration by Action**: Track slowest operations
+- **Spans per Service**: Monitor service load
+- **Errors per Service**: Track error rates
+
+**Applications:**
+- **default**: 9.73M traces
+- **smb-lending**: 614K traces
+- **otel**: 103K traces
+- **partner**: 1K traces
+
+**Advanced Analytics:**
+- AI-powered anomaly detection
+- Service-level performance trends
+- Error pattern analysis
+- Latency percentile analysis
+
+#### **Use Cases**
+
+1. **Performance Monitoring**
+   ```
+   Graph: "Max duration grouped by Action"
+   - POST Execute prepar...: 415s (peak)
+   - POST /v0/bbps...: 200s
+   - SELECT L:11 4-: 100s
+   ```
+
+2. **Load Analysis**
+   ```
+   Graph: "Spans per Service"
+   - billpayments: 138K spans (peak)
+   - shylock_prod: 80K spans
+   - webapp-gravit: 50K spans
+   ```
+
+3. **Error Tracking**
+   ```
+   Graph: "Errors per Service"
+   - secureapp-gra: 4.19K errors (peak)
+   - webapp-gravit: 2K errors
+   - sauron_gravito: 1.5K errors
+   ```
+
+#### **Real Example from Production**
+
+> "Coralogix helps me:
+> 1. **Monitor Service Health**: Real-time error rates per service
+> 2. **Identify Performance Issues**: Spot slow operations immediately
+> 3. **Analyze Traffic Patterns**: Understand load distribution
+> 4. **Set Up Alerts**: Get notified when error rates spike
+> 5. **Root Cause Analysis**: Correlate errors with performance degradation
+
+> Example: During peak hours, Coralogix showed:
+> - Error spike in `secureapp-gravit` (4.19K errors)
+> - Corresponding performance degradation
+> - Root cause: Database connection pool exhaustion
+> - Solution: Increased pool size, added read replicas"
+
+### **How We Use These Tools Together**
+
+#### **Production Debugging Workflow**
+
+```
+1. Alert Triggered (High Error Rate)
+   ↓
+2. Coralogix: Identify which service has errors
+   ↓
+3. SigNoz: Trace specific failed requests
+   ↓
+4. Kibana: Get detailed logs for root cause
+   ↓
+5. Fix & Deploy
+   ↓
+6. Monitor in all three tools
+```
+
+#### **Example: Debugging Repayment Failure**
+
+> "**Step 1: Coralogix Alert**
+> - Error rate spike in `prod-lrs` service
+> - 500 errors in last 5 minutes
+
+> **Step 2: SigNoz Trace Analysis**
+> - Filter: `serviceName: prod-lrs`, `status: error`
+> - Found: All failures in `processRepayment` operation
+> - Duration: Timeouts (>30s)
+
+> **Step 3: Kibana Log Analysis**
+> - Search: `application_id: "APP12345"` AND `level: "ERROR"`
+> - Found: `LMS API timeout after 30 seconds`
+> - Root cause: LMS service slow during peak hours
+
+> **Step 4: Solution**
+> - Implemented retry mechanism with exponential backoff
+> - Increased timeout for LMS calls
+> - Added circuit breaker (planned)
+
+> **Step 5: Verification**
+> - Monitored in Coralogix: Error rate dropped
+> - Verified in SigNoz: Request durations improved
+> - Confirmed in Kibana: No more timeout errors"
+
+### **Key Metrics We Track**
+
+| Metric | Tool | Threshold | Action |
+|--------|------|-----------|--------|
+| **Error Rate** | Coralogix | >1% | Investigate |
+| **P95 Latency** | SigNoz | >1s | Optimize |
+| **Log Volume** | Kibana | Spike >50% | Check for issues |
+| **Service Dependencies** | SigNoz | New failures | Update runbooks |
+| **Database Queries** | SigNoz | >100ms | Add indexes |
+
+### **Interview Talking Points**
+
+> "We use a **three-tier observability stack**:
+> 
+> **1. Kibana** for log analysis - 29+ million logs daily, helps with detailed debugging
+> **2. SigNoz** for distributed tracing - shows end-to-end request flows across microservices
+> **3. Coralogix** for APM - AI-powered insights, 10M+ traces in 15 minutes
+> 
+> **How we use them:**
+> - **Coralogix** alerts us to issues (error spikes, performance degradation)
+> - **SigNoz** helps us trace the request flow and identify bottlenecks
+> - **Kibana** provides detailed logs for root cause analysis
+> 
+> **Example**: When repayment processing failed:
+> - Coralogix showed error spike in prod-lrs
+> - SigNoz traced it to LMS API calls timing out
+> - Kibana logs showed the exact error messages
+> - Fixed by implementing retry mechanism
+> 
+> This observability stack gives us **complete visibility** into our production environment and helps us **debug issues quickly**."
+
+---
+
 ## 🤝 Conflict Resolution Examples
 
 ### **Example 1: Technical Disagreement**
