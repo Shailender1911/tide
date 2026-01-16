@@ -9,6 +9,33 @@ This comprehensive prep package is based on **YOUR ACTUAL CODEBASE** with **real
 
 ## 🗂️ DOCUMENT STRUCTURE
 
+### **⚠️ CRITICAL CORRECTIONS - READ THIS FIRST!**
+**File:** `TIDE_ACTUAL_SYSTEM_ARCHITECTURE_CORRECTIONS.md`
+
+**Why Read This First:**
+- ❌ I made WRONG assumptions about your Saga pattern
+- ✅ Corrects retry-based resilience vs compensation
+- ✅ Explains actual distributed locking with Redisson
+- ✅ Shows real event-driven architecture
+
+**MUST READ before interview** - Contains critical corrections to other docs!
+
+---
+
+### **🔧 STATE MACHINE & TRIGGER SYSTEM DEEP DIVE**
+**File:** `TIDE_STATE_MACHINE_EXPLAINED.md`
+
+**How It Actually Works:**
+- ✅ What is your "state machine"? (Progress tracker, not FSM)
+- ✅ How triggers get triggered (LMS_CLIENT_SETUP → CREATE_LOAN_TL)
+- ✅ 3-layer concurrency control (lock + idempotency + DB constraint)
+- ✅ Why async event processing?
+- ✅ Cross-questions with detailed answers
+
+**Key Insight:** Triggers fire IN SAME METHOD as stage insert (not database triggers, not polling)
+
+---
+
 ### **PART 1: ARCHITECTURE & SYSTEM DESIGN** 
 **File:** `TIDE_COMPLETE_PREP_PART1_ARCHITECTURE.md`
 
