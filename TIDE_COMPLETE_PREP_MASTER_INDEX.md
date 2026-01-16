@@ -9,6 +9,26 @@ This comprehensive prep package is based on **YOUR ACTUAL CODEBASE** with **real
 
 ## 🗂️ DOCUMENT STRUCTURE
 
+### **📖 START HERE: State Machine Concept from Beginner to Expert**
+**File:** `TIDE_STATE_MACHINE_FROM_SCRATCH.md`
+
+**READ THIS FIRST if you want to understand state machines from basics!**
+
+**What's Inside:**
+1. ✅ **The Business Problem** - Why we need state tracking
+2. ✅ **What Is a State Machine?** - Simple analogies (traffic light, Amazon order)
+3. ✅ **3 Traditional Approaches** - Single state enum, history table, workflow engines
+4. ✅ **What We Actually Built** - Progress tracker + Event triggers (with house building analogy)
+5. ✅ **Complete Walkthrough** - GPay loan application step-by-step (with timeline)
+6. ✅ **Why We Chose This** - Design decisions explained (boolean flags, event-driven, distributed locks)
+7. ✅ **Alternatives Considered** - AWS Step Functions, Camunda, Kafka, polling
+8. ✅ **Trade-offs Analysis** - What we gave up, what we gained
+9. ✅ **7 Interview Q&A** - With detailed answers
+
+**Perfect for:** Understanding the fundamentals before diving into technical details.
+
+---
+
 ### **⚠️ CRITICAL CORRECTIONS - READ THIS FIRST!**
 **File:** `TIDE_ACTUAL_SYSTEM_ARCHITECTURE_CORRECTIONS.md`
 
