@@ -240,31 +240,64 @@ Partner Integration = 3 Components:
 ## 5. TECHNICAL STACK
 
 ### **Backend:**
+
+**Orchestration Service:**
 - **Language:** Java 17
-- **Framework:** Spring Boot 3
+- **Framework:** Spring Boot 3.x (modern)
 - **ORM:** Hibernate/JPA
+- **Database:** MySQL 8
+- **Build:** Maven
+
+**ZipCredit Service:**
+- **Language:** Java 8
+- **Framework:** Spring Boot 2.6.3
+- **ORM:** MyBatis (XML-based SQL)
+- **Database:** MySQL 5.7
+- **Build:** Maven
+
+**Loan Repayment Service:**
+- **Language:** Java 8
+- **Framework:** Spring Boot 2.x
+- **ORM:** Hibernate/JPA
+- **Database:** MySQL
 - **Build:** Maven
 
 ### **Databases:**
-- **Primary:** MySQL 8 (master-slave replication)
-- **Secondary:** PostgreSQL 14 (orchestration, loan repayment)
-- **Cache:** Redis Cluster (distributed)
-- **Message Queue:** Kafka (event streaming)
+- **All Services:** MySQL (not PostgreSQL)
+- **Orchestration:** MySQL (orchestration DB)
+- **ZipCredit:** MySQL with MyBatis (master-slave replication)
+- **Loan Repayment:** MySQL (loan_repayment DB)
+- **Cache:** Redis (single instance, not cluster in dev/staging)
+- **Note:** No Kafka in current stack
 
 ### **Infrastructure:**
-- **Cloud:** AWS (hybrid with on-prem)
-- **Compute:** EC2 instances (t3.large)
-- **Container:** Docker + Kubernetes (EKS)
+- **Cloud:** AWS + On-premise (hybrid)
+- **Compute:** EC2 instances (t3.medium, t3.large)
+- **Container:** Docker + Kubernetes (EKS) - Production only
 - **Load Balancer:** AWS ALB
-- **Storage:** S3 (documents, reports)
-- **CI/CD:** GitLab CI → Jenkins → Kubernetes
+- **Storage:** AWS S3 (documents, reports, Excel files)
+- **Secrets:** AWS KMS (encryption) + AWS Secrets Manager
+- **CI/CD:** 
+  - Orchestration & Loan Repayment: GitLab CI → Jenkins → Kubernetes
+  - ZipCredit: Jenkins → Docker → EC2/K8s
 
 ### **Integrations:**
-- **LMS:** Finflux (loan management system)
-- **KYC:** Digio, NSDL (Aadhaar verification)
+- **LMS (Loan Management):** Finflux
+- **KYC/e-Sign:** Digio, NSDL (Aadhaar verification)
 - **Credit Bureau:** CIBIL, Experian, CRIF
-- **Payment:** NPCI (NACH), RazorPay, PayU gateway
-- **Monitoring:** Sentry, Coralogix, Prometheus, Grafana
+- **Payment Gateway:** NPCI (NACH), RazorPay, PayU Payment Gateway
+- **Monitoring & Observability:**
+  - **Error Tracking:** Sentry
+  - **Log Management:** Coralogix (centralized logging)
+  - **Metrics:** Micrometer (Spring Boot Actuator)
+  - **Tracing:** W3C Trace Context (distributed tracing)
+  - **Alerting:** PagerDuty, Slack
+- **File Transfer:** SFTP (for partner data exchange)
+- **Security:** 
+  - JWT (Nimbus JOSE+JWT)
+  - PGP Encryption (GPay integration)
+  - AWS KMS (data encryption)
+  - mTLS (GPay certificate-based auth)
 
 ---
 
@@ -393,10 +426,12 @@ PayU Lending India
 > - **Why separate:** Different team, batch processing, different DB
 >
 > **Tech Stack:**
-> - Java 17 + Spring Boot 3
-> - MySQL (master-slave) + Redis (distributed cache)
-> - Kubernetes (EKS) + Jenkins CI/CD
-> - Event-driven (Kafka) + Async processing (CompletableFuture)
+> - **Orchestration:** Java 17 + Spring Boot 3 + Hibernate/JPA + MySQL
+> - **ZipCredit:** Java 8 + Spring Boot 2.6 + MyBatis + MySQL (master-slave)
+> - **Loan Repayment:** Java 8 + Spring Boot 2 + Hibernate/JPA + MySQL
+> - **Cache:** Redis (single instance)
+> - **Infrastructure:** AWS + Kubernetes (EKS) + Jenkins CI/CD + Docker
+> - **Monitoring:** Sentry (errors) + Coralogix (logs) + Micrometer (metrics)
 >
 > **Trade-off:**
 > - ✅ **Pros:** Fast partner onboarding (2-3 months), independent scaling, fault isolation
@@ -500,7 +535,17 @@ PayU Lending India
 - Production issue resolution (memory leak, cache race)
 
 ### **Tech Stack:**
-- Java 17 + Spring Boot 3 + MySQL + Redis + Kafka
+- **Orchestration:** Java 17 + Spring Boot 3 + Hibernate/JPA + MySQL
+- **ZipCredit:** Java 8 + Spring Boot 2.6 + MyBatis + MySQL (master-slave)
+- **Loan Repayment:** Java 8 + Spring Boot 2 + Hibernate/JPA + MySQL
+- **Cache:** Redis (single instance, Redisson for distributed locks)
+- **Infrastructure:** AWS EC2 + Kubernetes (EKS) + Docker
+- **Monitoring:** Sentry (errors) + Coralogix (logs) + Micrometer (metrics)
+- **CI/CD:** GitLab CI → Jenkins → Kubernetes/Docker
+
+### **Tech Stack:**
+- Java 17 + Spring Boot 3
+- MySQL (master-slave) + Redis + Kafka
 - Kubernetes (EKS) + Jenkins + AWS
 - 99.95% uptime, p95 < 200ms
 
