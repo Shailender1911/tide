@@ -12,20 +12,37 @@ This comprehensive prep package is based on **YOUR ACTUAL CODEBASE** with **real
 ### **📖 START HERE: State Machine Concept from Beginner to Expert**
 **File:** `TIDE_STATE_MACHINE_FROM_SCRATCH.md`
 
+**⚠️ UPDATE:** Document updated to remove incorrect boolean flags references. See correction note at top.
+
 **READ THIS FIRST if you want to understand state machines from basics!**
 
 **What's Inside:**
 1. ✅ **The Business Problem** - Why we need state tracking
 2. ✅ **What Is a State Machine?** - Simple analogies (traffic light, Amazon order)
 3. ✅ **3 Traditional Approaches** - Single state enum, history table, workflow engines
-4. ✅ **What We Actually Built** - Progress tracker + Event triggers (with house building analogy)
+4. ✅ **What We Actually Built** - History-based tracker + Event triggers
 5. ✅ **Complete Walkthrough** - GPay loan application step-by-step (with timeline)
-6. ✅ **Why We Chose This** - Design decisions explained (boolean flags, event-driven, distributed locks)
+6. ✅ **Why We Chose This** - Design decisions explained (history table, event-driven, distributed locks)
 7. ✅ **Alternatives Considered** - AWS Step Functions, Camunda, Kafka, polling
 8. ✅ **Trade-offs Analysis** - What we gave up, what we gained
 9. ✅ **7 Interview Q&A** - With detailed answers
 
 **Perfect for:** Understanding the fundamentals before diving into technical details.
+
+---
+
+### **🔧 MOST ACCURATE TECHNICAL REFERENCE**
+**File:** `TIDE_CRITICAL_CORRECTION_REAL_STATE_TRACKING.md`
+
+**READ THIS for 100% accurate implementation details!**
+
+**What's Inside:**
+- ✅ **Single Source of Truth:** `a_application_stage_tracker` table (history-based)
+- ✅ **Core Queries:** How to get current state, check if stage exists, get full journey
+- ✅ **Why application_state is deprecated:** (491K vs 1.2M applications)
+- ✅ **Corrected interview answers:** What to say when asked
+
+**Use this as reference** when discussing technical implementation in interview!
 
 ---
 
