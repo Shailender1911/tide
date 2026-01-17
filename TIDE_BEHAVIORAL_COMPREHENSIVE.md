@@ -245,7 +245,175 @@ Time saved: 15 mins → 1 min
 
 ---
 
-## 3️⃣ **HANDLING STAKEHOLDER EXPECTATIONS**
+## 3️⃣ **COMPLEX BUG SOLVING (REAL STORY)**
+
+### **Q: Tell me about a challenging production bug you debugged**
+
+**STORY: GPay Loan Creation Validation Failures (Cache Race Condition)**
+
+**Situation:**
+> "GPay Term Loan applications were **intermittently failing** during loan creation. Success rate: 95% (good) but 5% failures were blocking ₹50L+ daily disbursals.
+> 
+> **Error in logs:**
+> ```
+> Application is not approved or lms client setup is not completed for applicationId: APP123
+> ```
+> 
+> **Strange part:** The status WAS set correctly in database, but validation was still failing."
+
+**Task:**
+> "Debug why validation was failing **immediately after** `LMS_CLIENT_SETUP_COMPLETED` status was set, even though the status existed in database."
+
+**Investigation (The Real Process):**
+
+**Step 1: Reproduce the issue**
+```
+Timeline:
+14:30:00 → LMS callback sets LMS_CLIENT_SETUP_COMPLETED status
+14:30:01 → createLoan API called (triggered by status change)
+14:30:02 → validateApplicationStatus() checks: "Is LMS setup done?"
+14:30:03 → Returns: FALSE (??!) → API fails with 400 BAD REQUEST
+
+Checked database:
+SELECT * FROM a_application_stage_tracker 
+WHERE application_id = 'APP123' 
+AND current_status = 'LMS_CLIENT_SETUP_COMPLETED';
+
+Result: Row EXISTS! Status was set at 14:30:00
+```
+
+**Step 2: Root Cause Analysis**
+```java
+// Original code (WRONG):
+private void validateApplicationStatus(String applicationId, Integer tenantId) {
+    // Problem: Uses selectApplicationTracker (CACHED METHOD)
+    applicationTrackerBeanList = applicationTrackerService
+        .selectApplicationTracker(applicationId, tenantId);
+    
+    // Cache has stale data (doesn't have LMS_CLIENT_SETUP_COMPLETED yet)
+    // Race condition window: 100-500ms
+}
+```
+
+**The Race Condition:**
+```
+Thread 1 (LMS Callback):
+14:30:00.000 → INSERT LMS_CLIENT_SETUP_COMPLETED into DB ✅
+14:30:00.100 → Cache invalidation triggered
+
+Thread 2 (Create Loan):
+14:30:00.050 → validateApplicationStatus() called
+14:30:00.060 → Reads from Redis cache (hasn't updated yet)
+14:30:00.070 → Cache shows: Only APPLICATION_APPROVED ❌
+14:30:00.080 → Validation fails!
+
+14:30:00.150 → Cache finally updated (too late!)
+```
+
+**Action (My Fix - Commit 31ed9d129f):**
+
+**Solution 1: Bypass Cache**
+```java
+// Changed from cached method to direct DB query
+applicationTrackerBeanList = applicationTrackerService
+    .selectApplicationTrackerFromDB(applicationId, tenantId);  
+    // Directly hits MySQL, bypasses Redis cache
+```
+
+**Solution 2: Retry with Exponential Backoff**
+```java
+// Added retry logic to handle race condition
+int maxRetries = 3;
+int retryDelayMs = 100;  // Start with 100ms
+
+for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+        // Get fresh data from DB (bypass cache)
+        applicationTrackerBeanList = applicationTrackerService
+            .selectApplicationTrackerFromDB(applicationId, tenantId);
+        
+        // Validate
+        boolean applicationLMSClientSetup = false;
+        for(ApplicationTrackerBean appTracker : applicationTrackerBeanList) {
+            if(appTracker.is_active() && 
+               ApplicationStage.LMS_CLIENT_SETUP_COMPLETED.toString()
+                   .equalsIgnoreCase(appTracker.getCurrent_status())) {
+                applicationLMSClientSetup = true;
+            }
+        }
+        
+        if(applicationApproved && applicationLMSClientSetup) {
+            logger.info("Validation passed on attempt {}", attempt);
+            return;  // Success!
+        }
+        
+        // If not last attempt, wait and retry
+        if(attempt < maxRetries) {
+            logger.warn("Validation failed, retrying after {}ms", retryDelayMs);
+            Thread.sleep(retryDelayMs);
+            retryDelayMs *= 2;  // Exponential backoff: 100ms → 200ms → 400ms
+        }
+    } catch (Exception e) {
+        logger.error("Error on attempt {}", attempt, e);
+    }
+}
+
+// If all retries failed
+throw new ZcV4Exception("Validation failed after 3 attempts", ...);
+```
+
+**Why This Solution?**
+```
+1. Bypass Cache: 
+   - Eliminates race condition
+   - Gets fresh data from source of truth (MySQL)
+
+2. Retry Logic:
+   - Handles network delays
+   - Handles transaction propagation delays
+   - Exponential backoff prevents hammering DB
+
+3. Better Logging:
+   - "Validation passed on attempt 2" → Know retry helped
+   - Helps track if issue persists
+```
+
+**Result:**
+> - ✅ **Success Rate**: 95% → 99.9% (5% failures → 0.1%)
+> - ✅ **Remaining 0.1%**: Real issues (app not actually approved)
+> - ✅ **GPay Disbursals**: ₹50L+ daily now flowing smoothly
+> - ✅ **Pattern Adopted**: Retry-with-bypass now used in 8 other critical validations
+> - ✅ **Production Stable**: Zero false validation failures since fix (3 months)
+
+**What I Learned:**
+> 1. **Cache invalidation is hard**: Even with proper cache eviction, there's a race window
+> 2. **Database is source of truth**: For critical validations, bypass cache
+> 3. **Retry is not always bad**: With exponential backoff, it's safer than cache
+> 4. **Log everything**: "Attempt 2 succeeded" tells you retry was needed
+
+**Alternative I Considered (But Rejected):**
+```
+Option: Use Distributed Lock
+
+RLock lock = redissonClient.getLock("VALIDATE:" + applicationId);
+if(lock.tryLock(5, TimeUnit.SECONDS)) {
+    try {
+        // Validate
+    } finally {
+        lock.unlock();
+    }
+}
+
+Why I Rejected:
+- Adds complexity (lock management)
+- Doesn't solve cache staleness (still need fresh data)
+- Lock contention under high load
+- My solution simpler: bypass cache + retry
+```
+
+**Key Takeaway:** "Race conditions in distributed systems often hide in timing windows. Bypass cache for critical paths, add retry for safety."
+
+---
 
 ### **Q: Tell me about a time you had to push back on a product requirement**
 
@@ -615,9 +783,9 @@ Solution:
 | **Stakeholder Management** | CIBIL Real-Time Feature | ₹21.4Cr saved | Data-driven pushback, alternatives, alignment |
 | **Learning from Failure** | NULL Migration Bug | 15 min downtime | Fast recovery, transparency, process improvement |
 | **Technical Decision** | MyBatis vs Hibernate | 50% faster queries | System design, trade-off analysis, long-term thinking |
-| **Disagreement (existing)** | Meesho Factory Pattern | 40% faster reviews | Design patterns, extensibility, conviction |
-| **Complex Bug (existing)** | GPay Race Condition | ₹5L/month saved | Distributed systems, 3-layer defense |
-| **Tight Deadline (existing)** | Insurance Consent | 7 days, 0 bugs | Scope control, parallel work, MVP thinking |
+| **Disagreement** | Meesho Factory Pattern | 40% faster reviews | Design patterns, extensibility, conviction |
+| **Complex Bug** | GPay Cache Race Condition | 95% → 99.9% success | Cache bypass, retry logic, production debugging |
+| **Tight Deadline** | Insurance Consent | 7 days, 0 bugs | Scope control, parallel work, MVP thinking |
 
 ---
 
