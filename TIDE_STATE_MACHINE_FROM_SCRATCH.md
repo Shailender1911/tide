@@ -4,6 +4,19 @@
 
 ---
 
+## ⚠️ **CRITICAL UPDATE (Jan 2026):**
+
+**CORRECTION ABOUT BOOLEAN FLAGS:**
+- This document originally mentioned `application_state` table with boolean flags (`is_loan_created: true/false`)
+- **REALITY:** That table is **DEPRECATED** (491K rows vs 1.2M applications = not maintained)
+- **ACTUAL SYSTEM:** Uses ONLY `a_application_stage_tracker` (history-based approach)
+- **Current state:** Query latest row with `ORDER BY updated_at DESC LIMIT 1`
+- See `TIDE_CRITICAL_CORRECTION_REAL_STATE_TRACKING.md` for complete details
+
+**TL;DR:** Ignore references to "boolean flags" - we use history table ONLY.
+
+---
+
 ## 📚 TABLE OF CONTENTS
 
 1. [The Business Problem We're Solving](#1-the-business-problem)
@@ -229,16 +242,17 @@ Engine tracks:
 
 ## 4. WHAT WE ACTUALLY BUILT
 
-### **Our Hybrid Approach: "Progress Tracker + Event-Driven Triggers"**
+### **Our Hybrid Approach: "History-Based Tracker + Event-Driven Triggers"**
 
-We **combined** ideas from all 3 approaches and added our own twist:
+We use a **single-table history approach** with event automation:
 
 ```
-1. Progress Tracker (Boolean Flags) - Like video game checkpoints
-2. State History (Audit Trail) - Full journey recorded
-3. Event Triggers (Automated Next Steps) - Like dominoes falling
-4. Distributed Locks (Prevent Duplicates) - Like taking turns
+1. History Tracker (All State Changes) - Complete audit trail
+2. Event Triggers (Automated Next Steps) - Like dominoes falling
+3. Distributed Locks (Prevent Duplicates) - Like taking turns
 ```
+
+**Key Insight:** Current state = Latest row in history table (not boolean flags)
 
 ### **Visual Metaphor: Building a House**
 
@@ -268,47 +282,7 @@ Electrical Contractor:
 
 ### **Our Database Design:**
 
-**Table 1: Application State (Boolean Flags = Checkpoints)**
-```sql
-CREATE TABLE application_state (
-    id BIGINT PRIMARY KEY,
-    los_application_id VARCHAR(255),
-    
-    -- Checkpoint flags (like game save points)
-    is_application_id_created BOOLEAN DEFAULT false,
-    is_eligible BOOLEAN DEFAULT false,
-    is_aadhaar_verified BOOLEAN DEFAULT false,
-    is_documents_uploaded BOOLEAN DEFAULT false,
-    is_kfs_signed BOOLEAN DEFAULT false,
-    is_nach_registered BOOLEAN DEFAULT false,
-    is_loan_created BOOLEAN DEFAULT false,
-    is_va_created BOOLEAN DEFAULT false,
-    is_loan_disbursed BOOLEAN DEFAULT false,
-    
-    created_at TIMESTAMP,
-    updated_at TIMESTAMP
-);
-```
-
-**Example:**
-```
-Application APP123 (in progress):
-┌────────────────────────────────┬─────────┐
-│ Checkpoint                     │ Status  │
-├────────────────────────────────┼─────────┤
-│ is_application_id_created      │ ✅ true  │
-│ is_eligible                    │ ✅ true  │
-│ is_aadhaar_verified            │ ✅ true  │
-│ is_documents_uploaded          │ ✅ true  │
-│ is_kfs_signed                  │ ✅ true  │
-│ is_nach_registered             │ ✅ true  │
-│ is_loan_created                │ ⏳ false │ ← Currently working on this
-│ is_va_created                  │ ⏳ false │
-│ is_loan_disbursed              │ ⏳ false │
-└────────────────────────────────┴─────────┘
-```
-
-**Table 2: Application Stage Tracker (Audit Trail = Journey Log)**
+**Single Table: Application Stage Tracker (History-Based = Journey Log)**
 ```sql
 CREATE TABLE a_application_stage_tracker (
     id BIGINT PRIMARY KEY,
@@ -317,32 +291,48 @@ CREATE TABLE a_application_stage_tracker (
     current_status VARCHAR(100),
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMP,
-    updated_at TIMESTAMP
+    updated_at TIMESTAMP,
+    
+    INDEX idx_app_status (application_id, current_status, is_active)
 );
 ```
 
 **Example:**
 ```
 Application APP123 journey:
-┌────┬──────────┬─────────────────┬────────────────────────┬─────────────────────┐
-│ ID │ app_id   │ prev_status     │ current_status         │ created_at          │
-├────┼──────────┼─────────────────┼────────────────────────┼─────────────────────┤
-│ 1  │ APP123   │ NULL            │ APPLICATION_CREATED    │ 2026-01-15 10:00:00 │
-│ 2  │ APP123   │ APPLICATION...  │ ELIGIBILITY_SUCCESS    │ 2026-01-15 10:05:00 │
-│ 3  │ APP123   │ ELIGIBILITY...  │ AADHAAR_VERIFIED       │ 2026-01-15 10:08:00 │
-│ 4  │ APP123   │ AADHAAR_VERI... │ DOCUMENTS_UPLOADED     │ 2026-01-15 10:12:00 │
-│ 5  │ APP123   │ DOCUMENTS_UP... │ NACH_MANDATE_SUCCESS   │ 2026-01-15 10:20:00 │
-│ 6  │ APP123   │ NACH_MANDATE... │ LMS_CLIENT_SETUP       │ 2026-01-15 10:25:00 │
-│ 7  │ APP123   │ LMS_CLIENT...   │ CREATE_LOAN_TL_SUCCESS │ 2026-01-15 10:30:00 │
-└────┴──────────┴─────────────────┴────────────────────────┴─────────────────────┘
+┌────┬──────────┬─────────────────┬────────────────────────┬───────────┬─────────────────────┐
+│ ID │ app_id   │ prev_status     │ current_status         │ is_active │ created_at          │
+├────┼──────────┼─────────────────┼────────────────────────┼───────────┼─────────────────────┤
+│ 1  │ APP123   │ NULL            │ APPLICATION_CREATED    │ ✅ true    │ 2026-01-15 10:00:00 │
+│ 2  │ APP123   │ APPLICATION...  │ ELIGIBILITY_SUCCESS    │ ✅ true    │ 2026-01-15 10:05:00 │
+│ 3  │ APP123   │ ELIGIBILITY...  │ AADHAAR_VERIFIED       │ ✅ true    │ 2026-01-15 10:08:00 │
+│ 4  │ APP123   │ AADHAAR_VERI... │ DOCUMENTS_UPLOADED     │ ✅ true    │ 2026-01-15 10:12:00 │
+│ 5  │ APP123   │ DOCUMENTS_UP... │ NACH_MANDATE_SUCCESS   │ ✅ true    │ 2026-01-15 10:20:00 │
+│ 6  │ APP123   │ NACH_MANDATE... │ LMS_CLIENT_SETUP       │ ✅ true    │ 2026-01-15 10:25:00 │
+│ 7  │ APP123   │ LMS_CLIENT...   │ CREATE_LOAN_TL_SUCCESS │ ✅ true    │ 2026-01-15 10:30:00 │ ← Latest (current state)
+└────┴──────────┴─────────────────┴────────────────────────┴───────────┴─────────────────────┘
 ```
 
-**Why Two Tables?**
+**How to Find Current State:**
+```sql
+-- Get current status (latest row)
+SELECT current_status FROM a_application_stage_tracker
+WHERE application_id = 'APP123' AND is_active = true
+ORDER BY updated_at DESC LIMIT 1;
 
-| Table | Purpose | Query Pattern | Update Frequency |
-|-------|---------|---------------|------------------|
-| **application_state** | **Fast lookups** | "Show me all apps where loan is created but not disbursed" | Update when major checkpoint reached |
-| **a_application_stage_tracker** | **Audit trail + Triggers** | "Show me when NACH was completed" | Insert on every status change |
+-- Result: "CREATE_LOAN_TL_SUCCESS"
+```
+
+**Why This Single-Table Design?**
+
+| Question | Answer |
+|----------|--------|
+| **Current state?** | Latest row: `ORDER BY updated_at DESC LIMIT 1` |
+| **Has KYC completed?** | Check existence: `WHERE current_status = 'AADHAAR_VERIFIED'` |
+| **Full journey?** | All rows: `WHERE application_id = 'APP123' ORDER BY created_at` |
+| **Performance?** | 2ms (indexed on application_id + current_status + is_active) |
+
+**Note:** There's an old `application_state` table in orchestration with boolean flags, but it's **DEPRECATED** (491K rows vs 1.2M applications = not maintained).
 
 ---
 
@@ -394,23 +384,13 @@ public Response createApplication(ApplicationRequest request) {
 
 **What Gets Saved:**
 
-**application_state table:**
-```
-┌────────────────────────────────┬─────────┐
-│ is_application_id_created      │ ✅ true  │ ← Only this is true
-│ is_eligible                    │ ❌ false │
-│ is_aadhaar_verified            │ ❌ false │
-│ ... (all other flags)          │ ❌ false │
-└────────────────────────────────┴─────────┘
-```
-
 **a_application_stage_tracker table:**
 ```
-┌────┬──────────┬─────────────────────┬─────────────────────┐
-│ ID │ app_id   │ current_status      │ created_at          │
-├────┼──────────┼─────────────────────┼─────────────────────┤
-│ 1  │ APP123   │ APPLICATION_CREATED │ 2026-01-15 10:00:00 │
-└────┴──────────┴─────────────────────┴─────────────────────┘
+┌────┬──────────┬─────────────────────┬───────────┬─────────────────────┐
+│ ID │ app_id   │ current_status      │ is_active │ created_at          │
+├────┼──────────┼─────────────────────┼───────────┼─────────────────────┤
+│ 1  │ APP123   │ APPLICATION_CREATED │ ✅ true    │ 2026-01-15 10:00:00 │
+└────┴──────────┴─────────────────────┴───────────┴─────────────────────┘
 ```
 
 ---
@@ -1579,11 +1559,14 @@ Here are the questions the interviewer might ask:
 
 ---
 
+**⚠️ CRITICAL UPDATE:** Earlier sections mention "boolean flags" - IGNORE THOSE. We use **history table ONLY** (`a_application_stage_tracker`). See `TIDE_CRITICAL_CORRECTION_REAL_STATE_TRACKING.md` for accurate technical details.
+
 **Interview Strategy:**
 - Start with business problem (lending application journey)
-- Explain our approach (progress tracker + events)
-- Compare with alternatives (Camunda, Kafka)
-- Discuss trade-offs (eventual consistency, no rollback)
+- Explain our approach (history-based tracker + events)
+- **Mention:** "Latest row = current state" (not boolean flags)
+- Compare with alternatives (Camunda, Kafka, boolean flags - we chose history)
+- Discuss trade-offs (query performance vs simplicity)
 - Show understanding of edge cases (failures, crashes, duplicates)
 
 Good luck! 🚀
