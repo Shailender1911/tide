@@ -551,6 +551,270 @@ PayU Lending India
 
 ---
 
-**Interview Tip:** Focus on **WHY** (business value) and **TRADE-OFFS** (what you gave up), not just **WHAT** (implementation).
+---
+
+## 9. KEY BEHAVIORAL QUESTIONS (STAR FORMAT)
+
+### **Q1: Tell me about a time you disagreed with your tech lead**
+
+**STORY: Meesho Auto-Disbursal Implementation (Factory Pattern)**
+
+**Situation:**
+> "When building auto-disbursal for Meesho, my tech lead proposed adding partner-specific logic directly in `LoanServiceImpl` with if-else conditions. This was a 2-day timeline requirement."
+
+**Task:**
+> "I needed to implement auto-disbursal that worked for Meesho's programs (Advanced Settlement, Credit Line) without breaking existing partners."
+
+**Action:**
+> "I disagreed with the if-else approach and proposed Factory Pattern instead:
+> - Created `AutoDisbursalFactory` to select handler
+> - Defined `AutoDisbursalHandler` interface
+> - Implemented `MeeshoAutoDisbursalHandler` for partner-specific logic
+> 
+> **How I convinced them:**
+> - Showed existing `BusinessProofHandlerFactory` pattern in codebase
+> - Demonstrated extensibility: new partner = new handler class (no core changes)
+> - Proved testability: each handler independently testable
+> - Compared code: 31 lines changed in core vs 157 lines in handlers
+> 
+> **I took 2.5 days instead of 2** (0.5 days extra for testing)."
+
+**Result:**
+> - ✅ Pattern adopted for Meesho (as_meesho_01, as_meesho_cli_01)
+> - ✅ Now extensible for future partners
+> - ✅ Code review time reduced by 40%
+> - ✅ Zero bugs in auto-disbursal logic post-release
+> - ✅ Tech lead later used same pattern for other features
+
+**Key Takeaway:** "Sometimes taking a bit more time upfront prevents months of technical debt."
+
+---
+
+### **Q2: Tell me about a time you failed**
+
+**STORY: GPay SFTP Upload Failure (BouncyCastle Dependency Conflict)**
+
+**Situation:**
+> "GPay batch file upload to SFTP started failing in production after a deployment. Error logs showed cryptographic provider issues with BouncyCastle library."
+
+**Task:**
+> "I needed to fix SFTP upload that was blocking GPay daily loan file processing (₹2Cr+ disbursals)."
+
+**My Initial Mistake:**
+> "I quickly fixed the immediate issue:
+> - Updated BouncyCastle version in the affected service
+> - Tested in dev environment → worked fine
+> - Deployed to staging → worked fine
+> - Deployed to production → BROKE again!
+> 
+> **What I missed:**
+> - Didn't check transitive dependencies across all modules
+> - Dev/staging had different dependency versions than production
+> - Multiple services had conflicting BouncyCastle versions
+> - Broke twice in production → lost partner trust temporarily"
+
+**What I Learned:**
+> 1. Always check entire dependency tree (`mvn dependency:tree`)
+> 2. Test with production-like environment (same JVM, same lib versions)
+> 3. Document critical library versions
+> 4. Never rush dependency updates
+
+**How I Finally Fixed It:**
+> ```
+> Commit: 1af20b76c2 - "fix: Unify BouncyCastle versions to 1.70 to fix GPay SFTP upload failure"
+> 
+> Actions:
+> - Unified ALL modules to BouncyCastle 1.70
+> - Added dependency management in parent POM
+> - Created integration test for SFTP connectivity
+> - Documented why we use 1.70 (compatibility with Java 8 + AWS KMS)
+> ```
+
+**Result:**
+> - ✅ Fixed permanently (zero SFTP failures since)
+> - ✅ Created dependency guidelines document
+> - ❌ But learned expensive lesson: broke production twice
+
+**Key Takeaway:** "Failing twice taught me that speed without thoroughness is worse than being slow initially. Now I always check transitive dependencies."
+
+---
+
+### **Q3: Tell me about a complex bug you solved**
+
+**STORY: GPay Cache Race Condition (Duplicate Loan Creation)**
+
+**Situation:**
+> "Production issue: 0.5% of GPay applications were creating duplicate loans right after `LMS_CLIENT_SETUP_COMPLETED` status. Cost: ₹5L/month in NBFC penalties."
+
+**Investigation:**
+> ```
+> Timeline of failure:
+> 10:00:00 → LMS callback sets status
+> 10:00:01 → Triggers loan creation (Instance 1)
+> 10:00:01 → Retry also triggers loan creation (Instance 2)
+> 10:00:02 → Both instances check cache: "Is loan created?" → NO (stale cache)
+> 10:00:03 → Both call CIBIL API
+> 10:00:04 → Both create loans → DUPLICATE!
+> ```
+
+**Root Cause:**
+> - We have 3 EC2 instances (load balanced)
+> - Redis cache had 5-minute TTL
+> - Between check and set, other instance inserted
+> - Cache was not distributed properly
+
+**My Solution (3-Layer Defense):**
+> ```java
+> // Layer 1: Distributed Lock (Redisson)
+> RLock lock = redissonClient.getLock("LOAN_CREATE:" + applicationId);
+> if (lock.tryLock(10, TimeUnit.SECONDS)) {
+>     try {
+>         // Layer 2: Idempotency Check (DB, bypass cache)
+>         ApplicationTrackerBean existing = applicationTrackerService
+>             .selectApplicationTrackerFromDB(applicationId, tenantId);
+>         
+>         if (checkIfStatusExists(existing, "CREATE_LOAN_TL_SUCCESS")) {
+>             logger.info("Loan already created, skipping");
+>             return; // Idempotent
+>         }
+>         
+>         // Process loan creation
+>         createLoanInFinflux(applicationId);
+>         
+>     } finally {
+>         lock.unlock();
+>     }
+> }
+> 
+> // Layer 3: Database Unique Constraint (last resort)
+> ALTER TABLE a_application_stage_tracker 
+> ADD UNIQUE INDEX idx_app_status (application_id, current_status);
+> ```
+
+**Result:**
+> - ✅ Duplicate loans: 0.5% → 0% (eliminated)
+> - ✅ Saved ₹5L/month in NBFC penalties
+> - ✅ Pattern now used across 8 critical events
+> - ✅ Improved partner trust (SLA restored)
+
+**Key Takeaway:** "In distributed systems, multiple layers of protection > single solution. Never trust cache in time-sensitive flows."
+
+---
+
+### **Q4: Tell me about a feature you delivered under tight deadline**
+
+**STORY: Insurance Consent for BharatPe (End-to-End in 1 Week)**
+
+**Situation:**
+> "BharatPe wanted loan insurance as an add-on during offer generation. Timeline: 1 week (including testing). Regulatory requirement for launch."
+
+**My Approach:**
+> **Day 1-2: Design**
+> - Created type-safe enums (`AddOnType`)
+> - Designed extensible DTO structure
+> - Validated with product team
+> 
+> **Day 3-4: Implementation**
+> ```java
+> Files created:
+> - AddOnType.java (enum)
+> - AddOnDetails.java (DTO)
+> - InsuranceCalculatorServiceImpl.java (business logic)
+> - AddOnValidationServiceImpl.java (validation)
+> - Integration in ZCVersion4ServiceImpl.java
+> 
+> Total: 5 files, 499+ lines
+> ```
+> 
+> **Day 5: Testing**
+> - Unit tests for all components
+> - Integration tests with mock data
+> - Edge cases: null, zero amounts, invalid types
+> 
+> **Day 6-7: Review & Deploy**
+> - Code review with senior dev
+> - Staging deployment
+> - Production deployment
+
+**Result:**
+> - ✅ Delivered in 7 days (on time)
+> - ✅ Zero bugs post-release
+> - ✅ Now supports 3 add-on types (easily extensible)
+> - ✅ Test coverage: 85%+
+
+**How I Met Deadline:**
+> 1. **Clear scope**: Focused on loan insurance only (not life/health)
+> 2. **Reused patterns**: Followed existing validation patterns
+> 3. **Parallel work**: Wrote tests while code was in review
+> 4. **No gold-plating**: Shipped MVP, documented future enhancements
+
+**Key Takeaway:** "Tight deadlines require ruthless scope control and leveraging existing patterns."
+
+---
+
+### **Q5: Tell me about working with multiple teams**
+
+**STORY: Multi-Partner UPI Mandate Integration (Swiggy, GPay, Meesho)**
+
+**Situation:**
+> "Three partners wanted different mandate implementations:
+> - Swiggy: UPI Mandate + API Mandate (both required)
+> - GPay: API Mandate only
+> - Meesho: Physical NACH + e-NACH
+> 
+> Each had different status tracking needs for user timeline."
+
+**Challenge:**
+> - Product team wanted unified timeline across partners
+> - Operations team needed to know which mandate type failed
+> - Frontend team needed consistent status codes
+> - Each partner had different failure scenarios
+
+**My Solution:**
+> ```java
+> // Made status tracking partner-agnostic
+> Set<ApplicationStage> mandateSuccessStagesToCheck = new HashSet<>(Arrays.asList(
+>     ApplicationStage.API_MANDATE_SUCCESS, 
+>     ApplicationStage.UPI_MANDATE_SUCCESS,
+>     ApplicationStage.NACH_MANDATE_SUCCESS   // Extensible for new types
+> ));
+> 
+> // Timeline shows: "Mandate Setup" → Success/Failed (hides technical details)
+> // Operations dashboard shows: Which mandate type (UPI/API/NACH)
+> ```
+
+**Collaboration:**
+> - **Product Team**: Weekly syncs on timeline UX
+> - **Frontend Team**: Provided consistent API response format
+> - **Operations Team**: Built admin dashboard with mandate type breakdown
+> - **Partner Teams**: Handled different webhook formats
+
+**Result:**
+> - ✅ Unified status tracking for all mandate types
+> - ✅ Easy to add new mandate types (just add enum)
+> - ✅ Frontend code unchanged across partners
+> - ✅ Reduced timeline API response time by 40% (fewer DB queries)
+
+**Key Takeaway:** "Abstract partner-specific logic behind a common interface. Make extensibility a first-class concern."
+
+---
+
+## 🎯 **QUICK BEHAVIORAL CHEAT SHEET**
+
+| Question Type | Your Story | Key Metrics |
+|---------------|-----------|-------------|
+| **Disagreement** | Meesho Auto-Disbursal Factory Pattern | Convinced tech lead, extensible design, 40% faster reviews |
+| **Failure** | BouncyCastle SFTP issue | Broke prod twice, learned dependency management, created guidelines |
+| **Complex Bug** | GPay Cache Race Condition | 0.5% → 0% duplicates, saved ₹5L/month, 3-layer defense |
+| **Tight Deadline** | Insurance Consent (7 days) | 5 files, 499 lines, zero bugs, 85% coverage |
+| **Multi-team** | UPI Mandate integration (3 partners) | Unified tracking, 40% faster API, extensible |
+
+---
+
+**Interview Tip:** When answering behavioral questions:
+1. **Use real commit IDs** (shows authenticity)
+2. **Mention metrics** (0.5% → 0%, ₹5L saved)
+3. **Show learning** (what you'd do differently)
+4. **Technical depth** (3-layer defense, not just "fixed it")
 
 Good luck! 🚀
