@@ -193,20 +193,31 @@ Single Tomcat WAR Deployment
 
 **Advantages in Our Use Case:**
 
-**1. Transaction Management**
-```java
-@Transactional
-public void processApplication(ApplicationRequest request) {
-    // Single transaction across multiple operations
-    applicationService.createApplication(request);
-    eligibilityService.checkEligibility(applicationId);
-    cibilService.pullCreditReport(applicationId);
-    documentService.generateDocuments(applicationId);
-    statusService.updateStatus(applicationId, "DOCUMENTS_GENERATED");
-    
-    // All commit together or rollback together
-    // No distributed transaction complexity
-}
+**1. State-Driven Event Architecture**
+```
+How our application flow ACTUALLY works:
+
+Step 1: Application Created
+├── Insert application data
+├── Insert state: APPLICATION_SUBMITTED in a_application_stage_tracker
+└── TriggerService fires: ELIGIBILITY_CHECK event (async)
+
+Step 2: Eligibility Check (async via CompletableFuture)
+├── Check eligibility
+├── Insert state: ELIGIBILITY_CHECKED
+└── TriggerService fires: CIBIL_PULL event (async)
+
+Step 3: CIBIL Pull (async)
+├── Call CIBIL API
+├── Insert state: CIBIL_PULLED
+└── TriggerService fires: OFFER_GENERATION event (async)
+
+Key Points:
+- Each step is its own transaction (NOT all in one)
+- State machine tracks progress in a_application_stage_tracker
+- Events processed asynchronously via CompletableFuture
+- If any step fails: RETRY (not rollback everything)
+- Distributed locking (Redisson) prevents duplicate processing
 ```
 
 **2. Performance**
@@ -621,35 +632,32 @@ Problem:
 - But business logic spans multiple tables
 
 Example:
-Application flow needs:
+Application flow accesses:
 - a_application (core)
 - a_application_stage_tracker (state)
 - a_cibil_response (credit)
 - a_aadhaar_response (KYC)
 - a_loan_details (loan)
 
-All in ONE transaction currently
+Each step is separate transaction with state tracking
 ```
 
-**2. Distributed Transactions**
+**2. Cross-Service Communication**
 ```
-Current (Monolith):
-@Transactional
-public void createLoan() {
-    // All or nothing
-    createLoanInDB();
-    createLoanInLMS();
-    generateDocuments();
-}
+Current (Monolith - ZipCredit):
+- Each step tracked in a_application_stage_tracker
+- Events triggered asynchronously
+- If step fails: RETRY (not rollback)
+- Distributed lock (Redisson) prevents duplicate processing
 
 After Extraction (Microservices):
-// Need Saga pattern
-1. Loan Service → Create loan
-2. LMS Service → Create in Finflux
-3. Document Service → Generate docs
-4. Compensation if any fails
+- Service-to-service via REST APIs
+- Webhook callbacks for async operations
+- Each service owns its state
+- Retry + Idempotency for reliability
 
-Complexity: 10x higher
+Approach: We don't use Saga with compensation.
+We use: Retry + State Tracking + Idempotency
 ```
 
 **3. Performance Impact**
@@ -1164,94 +1172,83 @@ Plan:
 #### **Q: "How do you handle distributed transactions with this hybrid architecture?"**
 
 **Your Answer:**
-> "Excellent question! We use **different strategies** based on consistency requirements:
+> "Great question! We DON'T use traditional distributed transactions (2PC/Saga with compensation). Instead, we use **State Machine + Retry + Idempotency**:
 >
-> **Strategy 1: Keep in Monolith (Preferred)**
-> ```java
-> // For critical transactional flows, we keep in ZipCredit monolith
-> @Transactional
-> public void processApplication() {
->     // Single ACID transaction
->     createApplication();
->     checkEligibility();
->     pullCreditReport();
->     generateOffers();
->     // All commit together or rollback
-> }
+> **Our Actual Approach: Event-Driven State Machine**
+> ```
+> How ZipCredit processes an application:
 > 
-> Why: No distributed transaction complexity
+> Step 1: Application Submitted
+> ├── Save application data (a_application)
+> ├── Insert state: APPLICATION_SUBMITTED (a_application_stage_tracker)
+> └── TriggerService fires next event asynchronously
+> 
+> Step 2: Eligibility Check (async via CompletableFuture)
+> ├── Acquire Redis lock (Redisson)
+> ├── Check if already processed (idempotency)
+> ├── Call eligibility service
+> ├── Insert state: ELIGIBILITY_CHECKED
+> ├── Release lock
+> └── TriggerService fires CIBIL_PULL event
+> 
+> Step 3: CIBIL Pull (async)
+> ├── Acquire Redis lock
+> ├── Call CIBIL API
+> ├── If FAILS: Retry with exponential backoff
+> ├── Insert state: CIBIL_PULLED
+> └── TriggerService fires next event
+> 
+> KEY PRINCIPLE:
+> - Each step is SEPARATE (not one big transaction)
+> - State tracked in a_application_stage_tracker
+> - If step fails: RETRY (not rollback everything)
+> - Distributed lock prevents duplicate processing
 > ```
 >
-> **Strategy 2: Event-Driven (Eventual Consistency)**
-> ```java
-> // For cross-service flows, we use events
+> **Cross-Service Communication (ZipCredit ↔ Loan Repayment)**
+> ```
+> Real Example: Loan Disbursal Flow
 > 
 > ZipCredit:
-> 1. Create loan in DB
-> 2. Insert status: LOAN_CREATED
-> 3. Trigger event (via TriggerService)
+> 1. Create loan record (a_loan_details)
+> 2. Call Finflux LMS API
+> 3. Insert state: LMS_CLIENT_SETUP_COMPLETED
+> 4. TriggerService fires CREATE_LOAN_TL event
 > 
-> Event Handler:
-> 4. Call Loan Repayment API (async)
-> 5. If fails: Retry with exponential backoff
-> 6. If still fails: DLQ for manual intervention
+> Event Handler (async):
+> 5. Acquire Redis lock for applicationId
+> 6. Check idempotency (is already processed?)
+> 7. Process loan creation in LMS
+> 8. Insert state: LOAN_CREATED
+> 9. Release lock
 > 
-> No 2PC, no Saga orchestrator
-> Just: Retry + Idempotency + Manual fallback
-> ```
->
-> **Strategy 3: Compensating Actions (Rare)**
-> ```
-> Use case: NACH mandate + Loan creation
-> 
-> Flow:
-> 1. Create NACH mandate (NACH Service)
-> 2. Create loan (ZipCredit)
-> 3. If loan creation fails:
->    → Cancel NACH mandate (compensating action)
-> 
-> But: We rarely do this. Usually retry instead of compensate.
-> ```
->
-> **Real Example: Loan Disbursal Flow**
-> ```
-> Step 1: ZipCredit creates loan
-> ├── Insert into a_loan_details
-> ├── Call Finflux LMS API
-> ├── Get LMS loan ID
-> └── Update a_loan_details with LMS ID
-> (All in ONE transaction)
-> 
-> Step 2: Trigger disbursal event
-> ├── TriggerService processes event (async)
-> └── CompletableFuture.runAsync(...)
-> 
-> Step 3: Loan Repayment service notified
-> ├── Webhook from Finflux: "Loan disbursed"
-> ├── Loan Repayment creates EMI schedule
-> ├── If fails: Retry 3 times
-> └── If still fails: Alert ops team
+> Loan Repayment Service:
+> - Gets webhook from Finflux: "Loan disbursed"
+> - Creates EMI schedule
+> - If fails: Retry (not cancel loan!)
 > 
 > Consistency: Eventual (within minutes)
 > ```
 >
-> **Why NOT Saga Pattern?**
+> **Why NOT Saga with Compensation?**
 > ```
-> Saga requires:
-> - Orchestrator (new service)
-> - Compensating actions for each step
-> - Complex state machine
-> - More code to maintain
+> We DON'T do this:
+> ❌ If step 3 fails → rollback step 2 → rollback step 1
 > 
-> Our approach:
-> - Simpler: Retry + idempotency
-> - Cheaper: No new infrastructure
-> - Good enough: 99.9% success rate with retries
+> We DO this:
+> ✅ If step 3 fails → RETRY step 3
+> ✅ State machine tracks: which steps completed
+> ✅ On retry: Skip completed steps, resume from failure
 > 
-> When we'd use Saga:
-> - If consistency SLA < 1 minute (currently: 5 minutes OK)
-> - If compensations complex (currently: rare)
-> - If compliance requires (currently: not required)
+> Why RETRY beats COMPENSATION for us:
+> 1. Most failures are transient (network, timeout)
+> 2. Retrying is simpler than reversing
+> 3. No "undo" logic to maintain
+> 4. 99%+ success rate with 3 retries
+> 
+> When would we compensate?
+> - Almost never in practice
+> - Manual intervention for edge cases (ops team handles)
 > ```
 >
 > **Idempotency Example:**
@@ -1341,31 +1338,31 @@ Plan:
 > ```
 >
 > **2. Tight Coupling**
-> ```java
-> // Example: Application flow
+> ```
+> Example: How modules depend on each other
 > 
-> @Transactional
-> public void processApplication(String appId) {
->     // Step 1: dgl-services
->     Application app = applicationService.create(request);
->     
->     // Step 2: dgl-connectors (same transaction)
->     CibilResponse cibil = cibilService.pullCredit(appId);
->     
->     // Step 3: dgl-status (same transaction)
->     statusService.updateStatus(appId, "CIBIL_PULLED");
->     
->     // Step 4: dgl-ruleEngine (same transaction)
->     Offers offers = ruleEngine.calculateOffers(appId, cibil);
->     
->     // All commit together or rollback
-> }
+> dgl-services calls:
+> ├── dgl-connectors (for CIBIL, KYC APIs)
+> ├── dgl-status (for state machine updates)
+> ├── dgl-ruleEngine (for offer calculation)
+> └── notification-engine (for SMS/email)
+> 
+> dgl-status calls:
+> ├── rdbms (for a_application_stage_tracker)
+> ├── dgl-utility (for Redis locks)
+> └── TriggerService (fires events to other modules)
+> 
+> Why they're coupled:
+> - Shared entity definitions (model module)
+> - Shared database mappers (rdbms module)
+> - Shared utilities (dgl-utility)
+> - Event-driven communication within monolith
 > 
 > If deployed separately:
-> - No single transaction
-> - Need distributed transaction (complex)
-> - Or eventual consistency (slower)
-> - Performance: 200ms → 800ms
+> - Each would need duplicate shared code
+> - Network calls instead of method calls
+> - Latency: In-memory (0.01ms) → HTTP (10-50ms)
+> - Harder to debug (distributed logs)
 > ```
 >
 > **3. Shared Utilities**
