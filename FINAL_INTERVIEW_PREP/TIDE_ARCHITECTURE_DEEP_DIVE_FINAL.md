@@ -496,21 +496,34 @@ loan-repayment/
     └── Scheduled jobs (Spring @Scheduled)
 ```
 
-**Why Separate Database?**
+**Database Architecture (Each Service = One Database):**
 ```
-loan_repayment DB:
-├── loan_details (disbursed loans)
-├── emi_schedule (repayment schedule)
-├── payment_transactions (all payments)
-├── late_fee_details
-├── foreclosure_requests
-└── settlement_reports
+Database Separation:
 
-Why separate:
-1. Transactional data (millions of rows)
-2. Heavy reporting queries (don't impact origination)
-3. Different backup/archival strategy
-4. Different team ownership
+ZipCredit Service → zipcredit_db (MySQL)
+├── All application data
+├── Loan details
+├── KYC, CIBIL, documents
+└── State machine (a_application_stage_tracker)
+
+Orchestration Service → orchestration_db (MySQL)
+├── Partner API data
+├── Webhook details
+├── Request/response audit
+└── API translation logs
+
+Loan Repayment Service → loan_repayment_db (MySQL)
+├── EMI collection data
+├── Payment transactions
+├── Foreclosure requests
+└── Repayment reports
+
+Why Each Service Has Its Own Database:
+1. Microservice principle: Data ownership
+2. Independent scaling (loan repayment has millions of transactions)
+3. Team ownership (each team owns their data)
+4. No cross-service queries (service-to-service via APIs)
+5. Independent backup/archival strategies
 ```
 
 ---
