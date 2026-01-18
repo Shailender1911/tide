@@ -438,8 +438,7 @@ ApplicationDetails findByLosApplicationIdAndPartnerId(String applicationId, Long
 **TTL Strategy:**
 > "Default 7 days for application data (rarely changes). Auth tokens have shorter TTL."
 
-**Honest Limitation:**
-> "We had a race condition bug where cache returned stale data during status transitions. Fixed by bypassing cache for critical validations."
+**Note:** Orchestration's cache is separate from ZipCredit's cache. The 7-day TTL applies to Orchestration service caching.
 
 ---
 
@@ -447,17 +446,19 @@ ApplicationDetails findByLosApplicationIdAndPartnerId(String applicationId, Long
 
 ### **Honest Answer:**
 
-**Problem We Faced:**
+**IMPORTANT: The cache race condition was in ZipCredit service, NOT Orchestration.**
+
+**Problem We Faced (ZipCredit Service):**
 ```java
-// GPay loan creation was failing because:
+// GPay loan creation was failing in ZipCredit because:
 // Thread 1: Inserts LMS_CLIENT_SETUP_COMPLETED at 14:30:00.000
-// Thread 2: Reads from cache at 14:30:00.050 (still has stale data)
+// Thread 2: Reads from ZipCredit's Redis cache at 14:30:00.050 (stale data)
 // Thread 2: Validation fails!
 ```
 
-**Our Fix (Commit 31ed9d129f):**
+**Our Fix in ZipCredit (Commit 31ed9d129f):**
 ```java
-// Bypass cache for critical validations
+// In ZCVersion4ServiceImpl.java - Bypass cache for critical validations
 applicationTrackerBeanList = applicationTrackerService
     .selectApplicationTrackerFromDB(applicationId, tenantId);  // Direct DB query
 
@@ -473,10 +474,15 @@ for (int attempt = 1; attempt <= maxRetries; attempt++) {
 ```
 
 **Cache Stampede Prevention:**
-> "Honest answer: We don't have explicit stampede prevention. TTL is long enough (7 days) that it's not a frequent problem. For shorter TTLs, we'd need locking or probabilistic early expiration."
+> "Honest answer: We don't have explicit stampede prevention. For Orchestration, TTL is 7 days so it's rare. For ZipCredit's application tracker cache, we bypass it for critical validations."
 
-**Redis Cluster vs Single Instance:**
-> "We use single Redis instance, not cluster. For our scale (~35-40 TPS), it's sufficient. Cluster adds operational complexity we don't need yet."
+**Redis Cluster Mode:**
+> "**Production runs Redis in CLUSTER mode**, not single instance. This provides:
+> - High availability (automatic failover)
+> - Data sharding across nodes
+> - Better scalability
+> 
+> We use Redisson client which handles cluster topology automatically."
 
 ---
 

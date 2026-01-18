@@ -267,7 +267,7 @@ Partner Integration = 3 Components:
 - **Orchestration:** MySQL (orchestration DB)
 - **ZipCredit:** MySQL with MyBatis (master-slave replication)
 - **Loan Repayment:** MySQL (loan_repayment DB)
-- **Cache:** Redis (single instance, not cluster in dev/staging)
+- **Cache:** Redis Cluster (production), single instance (dev/staging)
 - **Note:** No Kafka in current stack
 
 ### **Infrastructure:**
@@ -429,7 +429,7 @@ PayU Lending India
 > - **Orchestration:** Java 17 + Spring Boot 3 + Hibernate/JPA + MySQL
 > - **ZipCredit:** Java 8 + Spring Boot 2.6 + MyBatis + MySQL (master-slave)
 > - **Loan Repayment:** Java 8 + Spring Boot 2 + Hibernate/JPA + MySQL
-> - **Cache:** Redis (single instance)
+> - **Cache:** Redis Cluster (production)
 > - **Infrastructure:** AWS + Kubernetes (EKS) + Jenkins CI/CD + Docker
 > - **Monitoring:** Sentry (errors) + Coralogix (logs) + Micrometer (metrics)
 >
@@ -538,7 +538,7 @@ PayU Lending India
 - **Orchestration:** Java 17 + Spring Boot 3 + Hibernate/JPA + MySQL
 - **ZipCredit:** Java 8 + Spring Boot 2.6 + MyBatis + MySQL (master-slave)
 - **Loan Repayment:** Java 8 + Spring Boot 2 + Hibernate/JPA + MySQL
-- **Cache:** Redis (single instance, Redisson for distributed locks)
+- **Cache:** Redis Cluster (Redisson client for distributed locks)
 - **Infrastructure:** AWS EC2 + Kubernetes (EKS) + Docker
 - **Monitoring:** Sentry (errors) + Coralogix (logs) + Micrometer (metrics)
 - **CI/CD:** GitLab CI → Jenkins → Kubernetes/Docker

@@ -1588,7 +1588,7 @@ ZipCredit Service:
 ├── Instance 1 (EC2/Pod)  ─┐
 ├── Instance 2 (EC2/Pod)  ─┼──► Shared zipcredit_db (MySQL)
 └── Instance 3 (EC2/Pod)  ─┘
-                           └──► Shared Redis (Single Instance)
+                           └──► Shared Redis Cluster
 
 Orchestration Service:
 ├── Instance 1 (Pod)  ─┬──► Shared orchestration_db (MySQL)
@@ -1920,7 +1920,7 @@ OR (if Request 2 comes AFTER Request 1 completes):
 **Your Answer:**
 > "Critical question! Here's our approach:
 >
-> **Current setup:** Single Redis instance (not cluster)
+> **Current setup:** Redis Cluster mode in production (for HA and scalability)
 >
 > **If Redis goes down:**
 > ```
