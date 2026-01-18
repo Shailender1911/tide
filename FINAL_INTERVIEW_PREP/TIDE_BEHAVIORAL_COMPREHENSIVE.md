@@ -37,103 +37,84 @@
 
 **STORY: Memory Leak Investigation in Orchestration Service**
 
+**Reference:** [Confluence: Analysing High Heap Memory Usage in Orchestration](https://payufin.atlassian.net/wiki/spaces/Digilend/pages/2628551130/Analysing+High+Heap+Memory+Usage+in+Orchestration)
+
 **Situation:**
-> "One of our production EC2 instances hit 90% memory usage after running for 2 days. PagerDuty alerted at 3 AM. If not addressed, service would crash → all partner APIs down → ₹10Cr+ daily disbursals at risk."
+> "Our orchestration service pods were hitting 90% memory usage after running for 2-3 days. PagerDuty alerted. If not addressed, service would crash → all partner APIs down → ₹10Cr+ daily disbursals at risk."
 
 **Task:**
-> "I was on-call that week. My responsibility: identify root cause, implement fix, prevent recurrence."
+> "I identified the issue and did initial analysis, then coordinated with the team to implement the fix."
 
-**Action (Systematic 5-Step Approach):**
+**Root Causes Identified:**
 
-**Step 1: Immediate Mitigation (3 AM - 3:15 AM)**
-```
-- Scaled horizontally: 3 → 5 instances (distribute load)
-- Triggered heap dump before instance crashed (for analysis)
-- Alerted team on Slack
-- Monitored: Did memory stabilize? → NO, still climbing
-```
-
-**Step 2: Heap Dump Analysis (3:15 AM - 4:00 AM)**
-```bash
-# Downloaded heap dump from pod
-kubectl cp orchestration-pod-abc:/tmp/heapdump.hprof ./heapdump.hprof
-
-# Analyzed with Eclipse MAT
-# Top memory consumers:
-# 1. kycserviceApiCache: 1.2 GB (storing full Aadhaar XML responses)
-# 2. Large HashMap in ConfigService: 800 MB (never cleared)
-# 3. Connection pool: 200 MB (connections not released)
-```
-
-**Step 3: Code Analysis (4:00 AM - 5:00 AM)**
+**1. ThreadLocal Context Not Cleared (GooglePayContextHolder)**
 ```java
-// Found in OrchAuthenticationService.java
-@Cacheable("kycserviceApiCache")
-public KycResponse getKycDetails(String applicationId) {
-    // PROBLEM 1: Caching entire 500KB XML response
-    // PROBLEM 2: No TTL configured → cache grows indefinitely
-    // PROBLEM 3: 22M cache hits over 1 month → ~11 TB cached!
+// PROBLEM: ThreadLocal storing Google Pay JWT subject
+// Was NOT being cleared after request completion
+public class GooglePayContextHolder {
+    private static final ThreadLocal<String> GOOGLE_PAY_SUBJECT = new ThreadLocal<>();
+    
+    public static void setGooglePaySubject(String subject) {
+        GOOGLE_PAY_SUBJECT.set(subject);  // Set during auth
+    }
+    
+    // clearGooglePaySubject() was NOT being called!
+    // Thread returned to pool with context still attached → memory leak
 }
-
-// Found in CustomRedisCacheManager.java
-private Map<String, Object> configCache = new HashMap<>();
-// PROBLEM: Static map never cleared, grows with every config lookup
 ```
 
-**Step 4: Root Cause & Immediate Fix (5:00 AM - 6:00 AM)**
+**2. MDC (Mapped Diagnostic Context) Not Cleared**
 ```java
-// Immediate Fix (deployed at 5:30 AM):
-@Bean
-public RedisCacheConfiguration cacheConfiguration() {
-    return RedisCacheConfiguration.defaultCacheConfig()
-        .entryTtl(Duration.ofHours(4))  // Added TTL
-        .disableCachingNullValues()
-        .serializeValuesWith(SerializationPair.fromSerializer(
-            new GenericJackson2JsonRedisSerializer()));
-}
+// PROBLEM: MDC context was being set but never cleared
+// In LogFilter.java - MDC.put() was called but MDC.clear() was missing
+MDC.put("guid", guid);
+MDC.put("application-id", applicationId);
+MDC.put("hostName", hostName);
+// ... but no cleanup in finally block!
+```
 
-// Reduced cache size
-spring.cache.redis.max-entries=10000  // Was: unlimited
+**3. Unbounded Caches**
+```java
+// Redis cache had no proper TTL configuration
+// Cache kept growing indefinitely
+```
 
-// Cache only essential fields (not full XML)
-@Cacheable(value = "kycserviceApiCache", key = "#applicationId")
-public KycEssentialData getKycEssentialData(String applicationId) {
-    KycResponse full = callKycApi(applicationId);
-    return KycEssentialData.builder()
-        .name(full.getName())
-        .aadhaarNumber(full.getAadhaarNumber())
-        .build();  // Only 2KB instead of 500KB
+**The Fix (LogFilter.java):**
+```java
+@Override
+public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) {
+    // ... set MDC context ...
+    MDC.put("guid", guid);
+    MDC.put("application-id", applicationId);
+    MDC.put("hostName", hostName);
+    MDC.put("service", serviceName);
+    
+    try {
+        chain.doFilter(request, response);
+    } finally {
+        // CRITICAL FIX: Always clear to prevent memory leaks
+        // This ensures cleanup even if an exception occurs
+        MDC.clear();
+        GooglePayContextHolder.clearGooglePaySubject();
+    }
 }
 ```
 
-**Step 5: Long-term Prevention (Next Day)**
-```
-1. Added memory alerts:
-   - 75% → Warning (Slack)
-   - 85% → Critical (PagerDuty)
-
-2. Added GC monitoring:
-   - GC pause time > 1 second → Alert
-
-3. Implemented circuit breaker for cache:
-   - If cache.size() > 80% of max → Stop caching, direct API calls
-
-4. Weekly heap dump analysis (automated)
-
-5. Documentation:
-   - Created Confluence page: "Memory Leak Debugging Playbook"
-   - Shared learnings in team retro
+**Cache TTL Fix (CustomRedisCacheManager.java):**
+```java
+private long getTtl(String cacheName) {
+    // Added default TTL of 7 days instead of unbounded
+    return ttlConfig.getOrDefault(cacheName, TimeUnit.HOURS.toMillis(168));
+}
 ```
 
 **Result:**
-> - ✅ **Immediate**: Memory dropped from 3.3GB → 2.1GB
-> - ✅ **Performance**: GC pause time reduced from 5s → 0.5s
-> - ✅ **Reliability**: Zero memory-related incidents since (6 months)
-> - ✅ **Cost**: Reduced from 5 instances → 3 instances (40% infra cost saving)
-> - ✅ **Knowledge**: Playbook now used by entire team
-> - ✅ **Recognition**: Mentioned in quarterly all-hands by VP Engineering
+> - ✅ **Memory stabilized**: Pods no longer hitting 90% after 2-3 days
+> - ✅ **No more context leaks**: ThreadLocal properly cleaned up
+> - ✅ **Documentation**: Created Confluence page for future reference
+> - ✅ **Prevention**: Added memory monitoring alerts (75%, 85% thresholds)
 
-**Key Takeaway:** "Ownership means not just fixing the immediate issue, but building systems to prevent it from happening again."
+**Key Takeaway:** "ThreadLocal is powerful but dangerous. Always clear in a `finally` block. Same for MDC - it's per-thread and must be cleaned up to prevent memory leaks in thread pools."
 
 ---
 
@@ -811,7 +792,7 @@ Solution:
 
 | Category | Story | Key Metric | Skills Demonstrated |
 |----------|-------|-----------|---------------------|
-| **Production Ownership** | Memory Leak (Orchestration) | 40% infra cost saved | Incident management, root cause analysis, prevention |
+| **Production Ownership** | Memory Leak (ThreadLocal/MDC not cleared) | Memory stabilized | ThreadLocal cleanup, context management, prevention |
 | **Initiative** | ConfigNexus MCP Server | 75% time saved | Self-learning, innovation, team enablement |
 | **Stakeholder Management** | CIBIL Real-Time Feature | ₹21.4Cr saved | Data-driven pushback, alternatives, alignment |
 | **Learning from Failure** | BouncyCastle SFTP (Broke prod twice) | 0 failures since | Dependency management, thoroughness over speed |
