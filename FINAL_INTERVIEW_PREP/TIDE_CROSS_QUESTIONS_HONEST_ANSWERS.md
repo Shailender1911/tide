@@ -724,14 +724,19 @@ String encryptedPan = CryptoUtility.encryptHandlesNull(tenantId, panNumber.toUpp
 // logger.info("Processing for PAN: {}", maskPan(pan)); // Shows: XXXXX1234
 ```
 
-**What we encrypt:**
+**What we encrypt (CryptoUtility.encryptHandlesNull):**
 - PAN numbers (AES encryption)
 - Bank account numbers
-- Aadhaar (if stored, which we avoid)
+- Aadhaar numbers
+- **Addresses (line1, line2)** - encrypted in Aadhaar/KYC data
+- DOB
+- Phone numbers
+- Email addresses
 
 **What we don't encrypt:**
-- Names, addresses (PII but not classified as sensitive)
+- Names (stored in plaintext)
 - Application IDs
+- City, State, Pincode
 
 **Audit Logging:**
 > "We have audit tables (Hibernate Envers `@Audited` annotation) that track all changes to sensitive entities."
