@@ -16,23 +16,34 @@
 
 ## 1. OUR OBSERVABILITY STACK
 
+### **Actual Tools We Use**
+
+| Tool | URL | Purpose |
+|------|-----|---------|
+| **SigNoz** | `payuwibmo-signoz.payufin.in` | APM, Traces, Metrics, Service Map |
+| **Kibana/ELK** | `payufin-prod-kibana.payufin.io` | Log aggregation & search |
+| **Sentry** | - | Exception tracking & alerts |
+| **Redash** | - | Production database queries |
+
 ### **Layered Observability Architecture**
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        MONITORING LAYERS                            │
 ├─────────────────────────────────────────────────────────────────────┤
-│  ALERTING           │  Sentry → PagerDuty/Slack                     │
-│                     │  (Exceptions trigger alerts)                  │
+│  APM & TRACING      │  SigNoz                                       │
+│                     │  - Latency (p50, p90, p99)                    │
+│                     │  - Rate (ops/s)                               │
+│                     │  - Apdex score                                │
+│                     │  - Distributed traces                         │
+│                     │  - Service map                                │
+│                     │  - Exceptions                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│  LOG AGGREGATION    │  Kibana / ELK Stack                           │
+│                     │  (Centralized search across all services)     │
 ├─────────────────────────────────────────────────────────────────────┤
 │  ERROR TRACKING     │  Sentry                                       │
 │                     │  (Captures exceptions with stack traces)      │
-├─────────────────────────────────────────────────────────────────────┤
-│  LOG AGGREGATION    │  Coralogix                                    │
-│                     │  (Centralized search across all services)     │
-├─────────────────────────────────────────────────────────────────────┤
-│  METRICS            │  Micrometer + Actuator                        │
-│                     │  (JVM, request latency, custom metrics)       │
 ├─────────────────────────────────────────────────────────────────────┤
 │  DATABASE QUERIES   │  Redash                                       │
 │                     │  (Production DB queries - read-only)          │
@@ -42,15 +53,36 @@
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+### **SigNoz Dashboard - What I See (prod-orch)**
+
+From the screenshot at `payuwibmo-signoz.payufin.in/services/prod-orch`:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  SIGNOZ - prod-orch (Orchestration Service)                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  LEFT PANEL:           │  MAIN DASHBOARD:                           │
+│  ├── Services          │  ├── Latency Chart (p99: ~800ms, p50: ~100ms)
+│  ├── Traces            │  ├── Rate (ops/s): 20-60 ops/sec           │
+│  ├── Logs              │  ├── Apdex: 0.98+ (Threshold 0.5)          │
+│  ├── Dashboards        │  └── Key Operations table                  │
+│  ├── Alerts            │                                            │
+│  ├── Exceptions        │  TABS:                                     │
+│  ├── Service Map       │  ├── Overview                              │
+│  └── Usage Explorer    │  ├── DB Call Metrics                       │
+│                        │  └── External Metrics                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### **Tool-by-Tool Breakdown**
 
 | Tool | Purpose | When I Use It |
 |------|---------|---------------|
-| **Sentry** | Exception tracking, alerts | First look - see if exception is known |
-| **Coralogix** | Centralized log search | Search by application_id across services |
+| **SigNoz** | APM, Traces, Latency, Service Map | First look - check latency, error rate, traces |
+| **Kibana** | Centralized log search | Search by application_id across services |
+| **Sentry** | Exception tracking, alerts | See stack traces, error patterns |
 | **Redash** | Database queries | Check application state, config, history |
 | **SSH Logs** | Raw log files | Deep investigation, full context |
-| **Micrometer/Actuator** | Metrics, health | Check service health, memory, threads |
 
 ---
 
@@ -133,8 +165,11 @@ public class LogFilter implements Filter {
 ```
 SCENARIO: User says "My loan creation failed for application APP-2024-001234"
 
-SEARCH IN CORALOGIX:
-application-id:APP-2024-001234 AND level:ERROR
+OPTION 1: SEARCH IN KIBANA (ELK)
+Query: application-id:APP-2024-001234 AND level:ERROR
+
+OPTION 2: SEARCH IN SIGNOZ (Traces)
+Filter by: service=prod-orch, tag=application-id:APP-2024-001234
 
 RESULT: Find all errors across ALL services for this specific application
 ```
@@ -162,13 +197,13 @@ RESULT: Find all errors across ALL services for this specific application
               │
               ▼
     ┌─────────────────┐
-    │ 2. CHECK SENTRY │────▶ Known exception? ──▶ Quick fix path
-    │ (First look)    │
+    │ 2. CHECK SIGNOZ │────▶ Check latency spike, error rate
+    │ (APM Overview)  │      Service Map for dependencies
     └────────┬────────┘
-              │ No known exception
+              │
               ▼
     ┌─────────────────┐
-    │ 3. CORALOGIX    │
+    │ 3. KIBANA/ELK   │
     │ Search by       │
     │ application_id  │
     │ + time range    │
@@ -209,24 +244,37 @@ From Support/User:
 - Timestamp: ~14:30 IST today
 ```
 
-### **Step 2: Check Sentry**
+### **Step 2: Check SigNoz (APM)**
 
 ```
-WHY SENTRY FIRST?
-- If exception occurred, it's already captured
-- Shows stack trace immediately
-- Links to related issues (is this a pattern?)
+URL: payuwibmo-signoz.payufin.in/services/prod-orch
 
-WHAT I LOOK FOR:
-- Exception type
-- Stack trace
-- How many times this occurred
-- Which service/pod
+WHAT I CHECK:
+1. Overview Tab:
+   - Latency spike? (p99 normally ~800ms)
+   - Error rate increase?
+   - Rate drop? (normally 20-60 ops/s)
+   - Apdex drop below threshold?
+
+2. Traces Tab:
+   - Filter by time range
+   - Look for failed traces (red)
+   - Click to see full trace across services
+
+3. Exceptions Tab:
+   - See captured exceptions
+   - Stack traces with context
+
+4. Service Map:
+   - See dependencies
+   - Which downstream service is failing?
 ```
 
-### **Step 3: Search Coralogix**
+### **Step 3: Search Kibana (ELK)**
 
 ```
+URL: payufin-prod-kibana.payufin.io
+
 QUERY PATTERN:
 application-id:APP-2024-001234 AND (level:ERROR OR level:WARN)
 
@@ -234,8 +282,8 @@ THEN REFINE:
 application-id:APP-2024-001234 AND "CREATE_LOAN"
 
 CROSS-SERVICE SEARCH:
-application-id:APP-2024-001234 service:orchestration
-application-id:APP-2024-001234 service:zipcredit
+application-id:APP-2024-001234 AND service:orchestration
+application-id:APP-2024-001234 AND service:zipcredit
 ```
 
 ### **Step 4: Query Database via Redash**
@@ -334,12 +382,13 @@ Automatic retry mechanism handled it. No manual intervention needed.
 **How I identified it:**
 
 ```
-STEP 1: Sentry Alert
+STEP 1: SigNoz Alert
+- Error rate spike in prod-orch service
 - 50+ "Application not approved" errors in 1 hour
 - All from GPay partner
 - Intermittent - same application succeeds on retry
 
-STEP 2: Coralogix Analysis
+STEP 2: Kibana Log Analysis
 - Searched: application-id:APP-XYZ AND "not approved"
 - Found: Application WAS approved (APPROVED stage exists)
 - But validation was reading STALE cache
@@ -429,9 +478,9 @@ try {
 > 
 > **Step 1: Context Gathering** - Get application_id, timestamp, error message from support/user
 > 
-> **Step 2: Sentry Check** - See if exception is already captured, check stack trace
+> **Step 2: SigNoz Check** - Check APM metrics (latency, error rate), service map, and traces
 > 
-> **Step 3: Coralogix Search** - Search logs across all services using application_id as correlation key
+> **Step 3: Kibana Search** - Search logs across all services using application_id as correlation key
 > 
 > **Step 4: Database State** - Query Redash to check application state in `a_application_stage_tracker`
 > 
@@ -439,36 +488,41 @@ try {
 > 
 > **Step 6: Root Cause & Fix** - Document timeline, identify root cause, implement fix
 > 
-> The key is our MDC-based logging. Every log line contains `application-id`, which acts as a correlation ID across all services. This lets me trace a single application's journey through orchestration → zipcredit → loan-repayment."
+> The key is our MDC-based logging. Every log line contains `application-id`, which acts as a correlation ID across all services. Combined with SigNoz traces, I can see a single application's journey through orchestration → zipcredit → loan-repayment."
 
 ---
 
 ### **Q2: "How do you manage logs across multiple services?"**
 
 **Answer:**
-> "We use a combination of:
+> "We use a combination of tools:
 > 
-> **1. Structured Logging with MDC:**
+> **1. SigNoz for APM & Tracing:**
+> - Distributed traces across services
+> - Latency metrics (p50, p90, p99)
+> - Service map shows dependencies
+> - URL: `payuwibmo-signoz.payufin.in`
+> 
+> **2. Kibana/ELK for Log Search:**
+> - All logs shipped to Elasticsearch
+> - Search across services: `application-id:APP-123 AND level:ERROR`
+> - URL: `payufin-prod-kibana.payufin.io`
+> 
+> **3. Structured Logging with MDC:**
 > - Every request gets unique `guid` (request ID)
 > - Business context via `application-id` header
-> - Host/pod information for identifying which instance
+> - trace_id and span_id for distributed tracing
 > 
-> **2. Coralogix for Centralized Search:**
-> - All logs shipped to Coralogix
-> - Can search across services in one query
-> - Example: `application-id:APP-123 AND level:ERROR`
-> 
-> **3. Consistent Log Pattern:**
+> **4. Consistent Log Pattern:**
 > ```
 > timestamp | level | class | trace_id | span_id | requestId | application-id | host | service | message
 > ```
 > 
-> **4. Sentry for Exceptions:**
+> **5. Sentry for Exceptions:**
 > - Automatic capture of all exceptions
 > - Stack traces with context
-> - Linked to alerts via PagerDuty/Slack
 > 
-> The benefit? I can see an application's entire journey in one place, even though it passes through 3 different services and 8 different pods."
+> The benefit? In SigNoz, I can see latency and trace flow. In Kibana, I can drill down into specific logs. Together, I can debug any issue across our 3 services and 8+ pods."
 
 ---
 
@@ -535,14 +589,16 @@ try {
 
 ---
 
-### **Q5: Cross-Question: "What if Coralogix is down?"**
+### **Q5: Cross-Question: "What if Kibana/SigNoz is down?"**
 
 **Answer:**
 > "We have fallbacks:
 > 
-> 1. **Direct SSH to pods** - Logs are stored locally on each pod
-> 2. **Redash queries** - Database state tells the story even without logs
-> 3. **Sentry** - Exception tracking is separate from log aggregation
+> 1. **If Kibana down, use SigNoz** - Traces still available for debugging
+> 2. **If SigNoz down, use Kibana** - Logs still searchable
+> 3. **Direct SSH to pods** - Logs are stored locally on each pod
+> 4. **Redash queries** - Database state tells the story even without logs
+> 5. **Sentry** - Exception tracking is separate from log aggregation
 > 
 > Command I'd use:
 > ```bash
@@ -585,12 +641,18 @@ try {
 ╔══════════════════════════════════════════════════════════════╗
 ║              PRODUCTION DEBUGGING CHEAT SHEET                ║
 ╠══════════════════════════════════════════════════════════════╣
-║  TOOLS:                                                      ║
+║  TOOLS & URLS:                                               ║
+║  ├── SigNoz: payuwibmo-signoz.payufin.in (APM, Traces)       ║
+║  ├── Kibana: payufin-prod-kibana.payufin.io (Logs)           ║
 ║  ├── Sentry: Exception tracking                              ║
-║  ├── Coralogix: Centralized log search                       ║
 ║  ├── Redash: Database queries                                ║
-║  ├── Micrometer/Actuator: Metrics & health                   ║
 ║  └── SSH: Deep dive raw logs                                 ║
+╠══════════════════════════════════════════════════════════════╣
+║  SIGNOZ METRICS (prod-orch):                                 ║
+║  ├── Latency: p99 ~800ms, p50 ~100ms                         ║
+║  ├── Rate: 20-60 ops/s                                       ║
+║  ├── Apdex: 0.98+ (Threshold 0.5)                            ║
+║  └── Tabs: Overview | DB Call Metrics | External Metrics     ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  KEY LOG FIELDS:                                             ║
 ║  ├── application-id: Business correlation key                ║
@@ -605,9 +667,9 @@ try {
 ║  ├── webhook_details: Callback status                        ║
 ║  └── a_system_config: Configuration                          ║
 ╠══════════════════════════════════════════════════════════════╣
-║  CORALOGIX QUERIES:                                          ║
+║  KIBANA QUERIES:                                             ║
 ║  ├── application-id:APP-123 AND level:ERROR                  ║
-║  ├── application-id:APP-123 service:orchestration            ║
+║  ├── application-id:APP-123 AND service:orchestration        ║
 ║  └── "CREATE_LOAN" AND level:ERROR                           ║
 ╚══════════════════════════════════════════════════════════════╝
 ```
@@ -617,6 +679,6 @@ try {
 **Key Takeaways for Interview:**
 1. **Correlation IDs are essential** - application-id is the golden key
 2. **Structured approach** - 6-step debugging workflow
-3. **Multiple tools** - Don't rely on just one (Sentry, Coralogix, Redash)
-4. **Prevention** - Good logging > reactive debugging
+3. **Multiple tools** - SigNoz (APM), Kibana (Logs), Sentry, Redash
+4. **SigNoz metrics** - Know your normal: p99 ~800ms, 20-60 ops/s, Apdex 0.98+
 5. **Real examples** - Cache race condition, memory leak stories
