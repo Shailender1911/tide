@@ -17,7 +17,7 @@
 - [x] Managing stakeholder expectations
 
 ✅ **Failure & Learning**
-- [x] Time you failed (BouncyCastle)
+- [x] Time you failed (BouncyCastle SFTP - broke production twice)
 - [x] Mistake and how you recovered
 
 ✅ **Technical Excellence**
@@ -524,125 +524,158 @@ My presentation:
 
 ### **Q: Tell me about a time you made a mistake that impacted others**
 
-**STORY: Broke Production API for 15 Minutes (Database Migration Gone Wrong)**
+**STORY: GPay SFTP Upload Failure (BouncyCastle Dependency Conflict) - Broke Production TWICE**
 
 **Situation:**
-> "I deployed a database migration that added a new column `utilization_request_amount` to `a_application_tracker` table. Tested in staging, worked fine."
+> "GPay batch file upload to SFTP started failing in production after a routine deployment. Error logs showed cryptographic provider issues:
+> ```
+> java.security.NoSuchAlgorithmException: MD5 MessageDigest not available
+> BouncyCastle provider registered but not usable
+> ```
+> **Impact:** GPay daily loan file processing blocked → ₹2Cr+ disbursals at risk"
 
-**What Went Wrong:**
-> "Within 2 minutes of production deployment:
-> - **All GET /application-details APIs failed** (500 errors)
-> - Sentry flooded with 1000+ errors
-> - **Impact**: GPay, Meesho, Swiggy all broken
-> - **Business impact**: ₹50L+ disbursals blocked
+**My First Fix (Day 1) - WRONG APPROACH:**
+> "I quickly diagnosed the issue as BouncyCastle version mismatch:
+> - Updated BouncyCastle version in dgl-transport module (from 1.60 to 1.70)
+> - Tested in dev environment → **worked fine** ✅
+> - Deployed to staging → **worked fine** ✅
+> - Deployed to production → **BROKE AGAIN!** ❌
 > 
-> **My mistake:**
-> - Migration added column with `DEFAULT NULL`
-> - But Java entity had `@NotNull` annotation
-> - Hibernate validation failed on every read
-> - **I tested in staging with fresh data (all NULLs filled manually)**
-> - **Production had 1.2M old rows with NULL values**"
+> **What I missed:**
+> - I only checked ONE module, not the full dependency tree
+> - Dev/staging had different transitive dependencies than production
+> - Production had conflicting BouncyCastle versions across modules"
 
-**Immediate Action (0-5 mins):**
+**The SECOND Failure (Day 2):**
+> "I then updated BouncyCastle in two more modules:
+> - dgl-utility
+> - rdbms module
+> - Deployed again → **STILL FAILING!** ❌
+> 
+> **Now I had broken production twice in 2 days.**
+> - GPay team escalated
+> - My manager got involved
+> - I felt terrible"
+
+**Root Cause Deep Dive (Day 2 - Evening):**
 ```bash
-# 1. Rolled back deployment
-kubectl rollout undo deployment/orchestration
+# Finally ran full dependency analysis
+mvn dependency:tree | grep bouncycastle
 
-# 2. Verified rollback
-curl https://api.payu.in/orchestration/application-details/APP123
-# Status: 200 OK ✅
+# Found 4 different versions across modules!
+# dgl-transport: bcprov-jdk15on:1.70
+# dgl-utility: bcprov-jdk18on:1.72
+# rdbms: bcprov-jdk15on:1.60
+# Orchestration: bcprov-jdk15on:1.68
 
-# 3. Alerted team
-Slack: "Production API down due to my migration. Rolled back. Investigating."
-
-# Time to recovery: 5 minutes
+# Problem: Multiple BouncyCastle JARs on classpath
+# JVM loads first one found → version mismatch → provider fails
 ```
 
-**Root Cause Analysis (5-30 mins):**
-```sql
--- Problem: 1.2M rows with NULL in new column
-SELECT COUNT(*) FROM a_application_tracker 
-WHERE utilization_request_amount IS NULL;
--- Result: 1,187,243
-
--- My entity (wrong):
-@Entity
-@NotNull
-private BigDecimal utilizationRequestAmount;  // Can't be NULL!
-
--- Should have been:
-@Entity
-@Nullable  // or Optional<BigDecimal>
-private BigDecimal utilizationRequestAmount;
+**The Proper Fix (Day 3):**
+```xml
+<!-- Parent POM - Force single version everywhere -->
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcprov-jdk15on</artifactId>
+            <version>1.70</version>
+        </dependency>
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcpkix-jdk15on</artifactId>
+            <version>1.70</version>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
 ```
 
-**Proper Fix (30-60 mins):**
+**Also Fixed SftpClient.java (Added Defensive Registration):**
 ```java
-// Step 1: Fixed entity
-@Entity
-@Column(name = "utilization_request_amount")
-private BigDecimal utilizationRequestAmount;  // Removed @NotNull
-
-// Step 2: Backfill old data
-UPDATE a_application_tracker 
-SET utilization_request_amount = 0 
-WHERE utilization_request_amount IS NULL;
-
-// Step 3: Added validation in service layer
-if (utilizationRequestAmount == null) {
-    utilizationRequestAmount = BigDecimal.ZERO;
+// Static initializer to register BouncyCastle provider early
+static {
+    registerBouncyCastleProvider();
 }
 
-// Step 4: Re-deployed with fix
+private static void registerBouncyCastleProvider() {
+    Provider provider = Security.getProvider("BC");
+    if (provider == null) {
+        // Remove any conflicting provider first
+        Security.removeProvider("BC");
+        Security.addProvider(new BouncyCastleProvider());
+        
+        // VERIFY it actually works (my learning!)
+        try {
+            java.security.MessageDigest.getInstance("MD5", "BC");
+            logger.info("BouncyCastle provider registered and verified");
+        } catch (Exception e) {
+            logger.error("BouncyCastle JARs may not be in classpath!");
+        }
+    }
+}
 ```
 
-**What I Learned (Post-Mortem):**
+**What I Learned (The Hard Way):**
 ```
-1. Test with production-like data volume
-   - Staging had 1000 rows
-   - Production had 1.2M rows
-   - NULL handling behaves differently at scale
+1. NEVER fix dependency issues in isolation
+   - Always run: mvn dependency:tree
+   - Check ALL modules, not just the one failing
 
-2. Gradual rollout for schema changes
-   - Should have done: Add column → Backfill → Add validation
-   - I did: All in one deployment
+2. Dev/Staging ≠ Production
+   - WAR file construction differs
+   - Classpath ordering differs
+   - Always test with production-like build
 
-3. Monitor immediately after deployment
-   - I deployed and went to lunch
-   - Should have watched Sentry for 15 mins
+3. Cryptographic libraries are special
+   - JVM caches security providers
+   - Multiple versions = unpredictable behavior
+   - Need explicit version management
 
-4. Communication
-   - Should have announced "High-risk migration at 2 PM, stay online"
-   - Team was surprised by outage
+4. Two failures = stop and rethink
+   - After first failure: I should have paused
+   - Instead I rushed → broke again
+   - Slow down = faster overall
 ```
 
-**Prevention Measures:**
+**Prevention Measures I Implemented:**
 ```
-1. Created "Database Migration Checklist":
-   ☐ Test with production row count
-   ☐ Check for NULL values in production
-   ☐ Gradual rollout (add → backfill → enforce)
-   ☐ Monitor for 15 mins post-deployment
-   ☐ Announce high-risk changes
+1. Created "Dependency Update Checklist":
+   ☐ Run mvn dependency:tree across all modules
+   ☐ Check for version conflicts
+   ☐ Update in dependencyManagement (not individual POMs)
+   ☐ Test with production-like WAR build
+   ☐ Verify cryptographic operations post-deploy
 
-2. Added pre-deployment validation:
-   - Script to check NULL count in production
-   - Alerts if > 1000 NULLs found
+2. Added integration test:
+   @Test
+   public void testSftpConnectivity() {
+       // Verifies BouncyCastle is correctly loaded
+       assertNotNull(Security.getProvider("BC"));
+   }
 
-3. Improved staging environment:
-   - Weekly refresh from production (anonymized)
-   - Same data volume, different values
+3. Documented why we use 1.70:
+   - Compatible with Java 8
+   - Compatible with AWS KMS
+   - Tested with SSHJ library
 ```
 
 **Result:**
-> - ❌ **Downtime**: 15 minutes (4:00 PM - 4:15 PM)
-> - ❌ **Applications affected**: ~200 (during peak hour)
-> - ✅ **Recovery**: Fast (5 mins rollback)
-> - ✅ **Learning**: Shared in team retro, created checklist
-> - ✅ **Transparency**: I wrote post-mortem, shared learnings
-> - ✅ **Redemption**: Zero similar incidents since (8 months)
+> - ❌ **Broke production twice** (Day 1 and Day 2)
+> - ❌ **Lost partner trust temporarily** (GPay escalated)
+> - ❌ **Personal embarrassment** (Manager involvement)
+> - ✅ **Fixed permanently** (Zero SFTP failures since - 8 months)
+> - ✅ **Created dependency guidelines** (Now team standard)
+> - ✅ **Added verification step** (Defensive coding in SftpClient)
+> - ✅ **Learning shared** (Presented in team retro)
 
-**Key Takeaway:** "Mistakes are inevitable. What matters is: fast recovery, transparent communication, and preventing recurrence."
+**Key Takeaway:** "This failure taught me that speed without thoroughness is worse than being slow initially. Rushing the first fix led to a second failure. Now I always:
+1. Check full dependency tree
+2. Test with production-like build
+3. If first fix fails, STOP and rethink completely"
+
+**Why This Made Me a Better Engineer:**
+> "Before this incident, I thought I was 'fast'. After breaking production twice, I realized that **sustainable speed comes from thoroughness, not rushing**. Now my first question on any dependency issue is 'What else uses this library?' - a question I should have asked on Day 1."
 
 ---
 
@@ -781,7 +814,7 @@ Solution:
 | **Production Ownership** | Memory Leak (Orchestration) | 40% infra cost saved | Incident management, root cause analysis, prevention |
 | **Initiative** | ConfigNexus MCP Server | 75% time saved | Self-learning, innovation, team enablement |
 | **Stakeholder Management** | CIBIL Real-Time Feature | ₹21.4Cr saved | Data-driven pushback, alternatives, alignment |
-| **Learning from Failure** | NULL Migration Bug | 15 min downtime | Fast recovery, transparency, process improvement |
+| **Learning from Failure** | BouncyCastle SFTP (Broke prod twice) | 0 failures since | Dependency management, thoroughness over speed |
 | **Technical Decision** | MyBatis vs Hibernate | 50% faster queries | System design, trade-off analysis, long-term thinking |
 | **Disagreement** | Meesho Factory Pattern | 40% faster reviews | Design patterns, extensibility, conviction |
 | **Complex Bug** | GPay Cache Race Condition | 95% → 99.9% success | Cache bypass, retry logic, production debugging |
@@ -796,13 +829,13 @@ Solution:
 **Step 1: Pick the Right Story**
 ```
 Question Type → Story Mapping:
-- "...you failed" → BouncyCastle OR NULL migration
+- "...you failed" → BouncyCastle SFTP (broke prod twice)
 - "...owned production issue" → Memory leak
 - "...went above and beyond" → ConfigNexus
 - "...pushed back" → CIBIL real-time
 - "...technical decision" → MyBatis vs Hibernate
 - "...disagreed with lead" → Meesho factory pattern
-- "...complex bug" → GPay race condition
+- "...complex bug" → GPay cache race condition
 ```
 
 **Step 2: STAR Format (30-60 seconds per section)**
