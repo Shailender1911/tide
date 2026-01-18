@@ -21,7 +21,8 @@
 | Tool | URL | Purpose |
 |------|-----|---------|
 | **SigNoz** | `payuwibmo-signoz.payufin.in` | APM, Traces, Metrics, Service Map |
-| **Kibana/ELK** | `payufin-prod-kibana.payufin.io` | Log aggregation & search |
+| **Kibana/ELK** | `payufin-prod-kibana.payufin.io` | Log search & visualization |
+| **Coralogix** | - | Centralized log aggregation & alerting |
 | **Sentry** | - | Exception tracking & alerts |
 | **Redash** | - | Production database queries |
 
@@ -39,8 +40,9 @@
 │                     │  - Service map                                │
 │                     │  - Exceptions                                 │
 ├─────────────────────────────────────────────────────────────────────┤
-│  LOG AGGREGATION    │  Kibana / ELK Stack                           │
-│                     │  (Centralized search across all services)     │
+│  LOG AGGREGATION    │  Coralogix + Kibana/ELK                       │
+│                     │  - Coralogix: Centralized aggregation         │
+│                     │  - Kibana: Search & visualization             │
 ├─────────────────────────────────────────────────────────────────────┤
 │  ERROR TRACKING     │  Sentry                                       │
 │                     │  (Captures exceptions with stack traces)      │
@@ -503,26 +505,31 @@ try {
 > - Service map shows dependencies
 > - URL: `payuwibmo-signoz.payufin.in`
 > 
-> **2. Kibana/ELK for Log Search:**
-> - All logs shipped to Elasticsearch
+> **2. Coralogix for Log Aggregation:**
+> - All logs shipped centrally
+> - Alerting on error patterns
+> - Long-term log retention
+> 
+> **3. Kibana/ELK for Log Search:**
 > - Search across services: `application-id:APP-123 AND level:ERROR`
+> - Log visualization and dashboards
 > - URL: `payufin-prod-kibana.payufin.io`
 > 
-> **3. Structured Logging with MDC:**
+> **4. Structured Logging with MDC:**
 > - Every request gets unique `guid` (request ID)
 > - Business context via `application-id` header
 > - trace_id and span_id for distributed tracing
 > 
-> **4. Consistent Log Pattern:**
+> **5. Consistent Log Pattern:**
 > ```
 > timestamp | level | class | trace_id | span_id | requestId | application-id | host | service | message
 > ```
 > 
-> **5. Sentry for Exceptions:**
+> **6. Sentry for Exceptions:**
 > - Automatic capture of all exceptions
 > - Stack traces with context
 > 
-> The benefit? In SigNoz, I can see latency and trace flow. In Kibana, I can drill down into specific logs. Together, I can debug any issue across our 3 services and 8+ pods."
+> The benefit? SigNoz for high-level APM and traces, Coralogix for centralized aggregation and alerts, Kibana for detailed log search. Together, I can debug any issue across our 3 services and 8+ pods."
 
 ---
 
@@ -643,7 +650,8 @@ try {
 ╠══════════════════════════════════════════════════════════════╣
 ║  TOOLS & URLS:                                               ║
 ║  ├── SigNoz: payuwibmo-signoz.payufin.in (APM, Traces)       ║
-║  ├── Kibana: payufin-prod-kibana.payufin.io (Logs)           ║
+║  ├── Kibana: payufin-prod-kibana.payufin.io (Log search)     ║
+║  ├── Coralogix: Centralized log aggregation & alerts         ║
 ║  ├── Sentry: Exception tracking                              ║
 ║  ├── Redash: Database queries                                ║
 ║  └── SSH: Deep dive raw logs                                 ║
