@@ -4,25 +4,12 @@
 
 ---
 
-## ⚠️ **CRITICAL UPDATE (Jan 2026):**
-
-**CORRECTION ABOUT BOOLEAN FLAGS:**
-- This document originally mentioned `application_state` table with boolean flags (`is_loan_created: true/false`)
-- **REALITY:** That table is **DEPRECATED** (491K rows vs 1.2M applications = not maintained)
-- **ACTUAL SYSTEM:** Uses ONLY `a_application_stage_tracker` (history-based approach)
-- **Current state:** Query latest row with `ORDER BY updated_at DESC LIMIT 1`
-- See `TIDE_CRITICAL_CORRECTION_REAL_STATE_TRACKING.md` for complete details
-
-**TL;DR:** Ignore references to "boolean flags" - we use history table ONLY.
-
----
-
 ## 📚 TABLE OF CONTENTS
 
 1. [The Business Problem We're Solving](#1-the-business-problem)
 2. [What Is a State Machine? (General Concept)](#2-what-is-a-state-machine-general-concept)
-3. [Traditional State Machine Approaches](#3-traditional-state-machine-approaches)
-4. [What We Actually Built (And Why It's Different)](#4-what-we-actually-built)
+3. [Traditional Approaches & Why We Didn't Use Them](#3-traditional-approaches--why-we-didnt-use-them)
+4. [What We Actually Built](#4-what-we-actually-built)
 5. [How Our System Works (Step by Step)](#5-how-our-system-works-complete-walkthrough)
 6. [Why We Chose This Design](#6-why-we-chose-this-design)
 7. [Alternatives We Considered](#7-alternatives-we-considered)
@@ -100,9 +87,7 @@ Rules:
 
 ---
 
-## 3. TRADITIONAL STATE MACHINE APPROACHES
-
-When we started building the lending system, we evaluated 3 traditional approaches:
+## 3. TRADITIONAL APPROACHES & WHY WE DIDN'T USE THEM
 
 ### **Approach 1: Single State Column (Enum-Based)**
 
@@ -112,1461 +97,522 @@ CREATE TABLE application (
     id INT PRIMARY KEY,
     application_id VARCHAR(255),
     current_state ENUM('PENDING', 'KYC_DONE', 'APPROVED', 'LOAN_CREATED', 'DISBURSED'),
-    created_at TIMESTAMP,
     updated_at TIMESTAMP
 );
 ```
 
-**Example:**
-```
-Application APP123:
-┌─────┬──────────┬───────────────┬─────────────────────┐
-│ id  │ app_id   │ current_state │ updated_at          │
-├─────┼──────────┼───────────────┼─────────────────────┤
-│ 1   │ APP123   │ PENDING       │ 2026-01-15 10:00:00 │
-│     │          │ ↓             │                     │
-│     │          │ KYC_DONE      │ 2026-01-15 10:05:00 │ (state updated)
-│     │          │ ↓             │                     │
-│     │          │ APPROVED      │ 2026-01-15 10:10:00 │ (state updated)
-└─────┴──────────┴───────────────┴─────────────────────┘
-```
-
-**How It Works:**
-```java
-// Update state
-UPDATE application 
-SET current_state = 'APPROVED', updated_at = NOW() 
-WHERE application_id = 'APP123';
-
-// Query: Find all approved applications
-SELECT * FROM application WHERE current_state = 'APPROVED';
-```
-
-**Pros:**
-- ✅ **Simple** - Easy to understand
-- ✅ **Fast queries** - `WHERE current_state = 'APPROVED'`
-- ✅ **Enforced consistency** - Can only be in one state
-
-**Cons:**
+**Why We Didn't Use It:**
 - ❌ **Lost history** - Can't see it was KYC_DONE yesterday
-- ❌ **Hard to retry** - If APPROVED fails, how to go back to KYC_DONE?
-- ❌ **Race conditions** - Two updates at same time overwrite each other
+- ❌ **Hard to retry** - If APPROVED fails, how to go back?
 - ❌ **Rigid flow** - Can't handle parallel steps (KYC + Credit check at same time)
 
 ---
 
-### **Approach 2: State History Table**
+### **Approach 2: Workflow Engines (Camunda, AWS Step Functions)**
 
-**Design:**
-```sql
-CREATE TABLE application (
-    id INT PRIMARY KEY,
-    application_id VARCHAR(255)
-);
-
-CREATE TABLE application_state_history (
-    id INT PRIMARY KEY,
-    application_id VARCHAR(255),
-    state VARCHAR(50),
-    created_at TIMESTAMP
-);
-```
-
-**Example:**
-```
-Application APP123:
-┌─────┬──────────┬───────────┬─────────────────────┐
-│ id  │ app_id   │ state     │ created_at          │
-├─────┼──────────┼───────────┼─────────────────────┤
-│ 1   │ APP123   │ PENDING   │ 2026-01-15 10:00:00 │
-│ 2   │ APP123   │ KYC_DONE  │ 2026-01-15 10:05:00 │
-│ 3   │ APP123   │ APPROVED  │ 2026-01-15 10:10:00 │
-└─────┴──────────┴───────────┴─────────────────────┘
-```
-
-**How It Works:**
-```java
-// Add new state
-INSERT INTO application_state_history 
-VALUES (NULL, 'APP123', 'APPROVED', NOW());
-
-// Get current state (latest row)
-SELECT state FROM application_state_history 
-WHERE application_id = 'APP123' 
-ORDER BY created_at DESC LIMIT 1;
-```
-
-**Pros:**
-- ✅ **Full history** - Can see entire journey
-- ✅ **Audit trail** - Know when each step happened
-- ✅ **Easy retry** - Just insert new row
-
-**Cons:**
-- ❌ **Slow queries** - "Find all approved" needs ORDER BY + GROUP BY
-- ❌ **Still sequential** - Can't handle parallel steps
-- ❌ **No partial completion** - Either approved or not (can't track "50% of documents signed")
+**Why We Didn't Use It:**
+- ❌ **Overkill** - We needed progress tracking, not complex orchestration
+- ❌ **Learning curve** - Team unfamiliar with BPMN
+- ❌ **Vendor lock-in** - Hard to customize for lending-specific needs
+- ❌ **Operational overhead** - Another service to maintain
 
 ---
 
-### **Approach 3: Workflow Engine (BPM Tools)**
+### **Approach 3: Event-Driven (Kafka State Store)**
 
-**Examples:** Camunda, Apache Airflow, Temporal
-
-**Design:**
-```
-Define workflow in XML/YAML:
-- Step 1: KYC verification
-- Step 2: Credit check
-- Step 3: Loan approval
-- Step 4: Disbursal
-
-Engine tracks:
-- Which step is running
-- Which steps completed
-- Which failed
-```
-
-**Pros:**
-- ✅ **Visual designer** - Non-developers can design flows
-- ✅ **Built-in retry** - Automatic retries on failure
-- ✅ **Parallel execution** - Can run multiple steps at once
-- ✅ **State persistence** - Survives server restarts
-
-**Cons:**
-- ❌ **Heavy** - Requires separate service (Camunda, Temporal)
-- ❌ **Learning curve** - Team needs to learn new tool
-- ❌ **Vendor lock-in** - Hard to migrate away
-- ❌ **Overkill** - Too complex for simple sequential flows
+**Why We Didn't Use It:**
+- ❌ **Complexity** - Kafka adds infrastructure overhead
+- ❌ **Not needed** - We don't have millions of events per second
+- ❌ **Debugging difficulty** - Hard to trace state from event log
 
 ---
 
 ## 4. WHAT WE ACTUALLY BUILT
 
-### **Our Hybrid Approach: "History-Based Tracker + Event-Driven Triggers"**
+### **Our Approach: History-Based State Tracking with Event Triggers**
 
-We use a **single-table history approach** with event automation:
+We built a **simple but effective** system with:
 
-```
-1. History Tracker (All State Changes) - Complete audit trail
-2. Event Triggers (Automated Next Steps) - Like dominoes falling
-3. Distributed Locks (Prevent Duplicates) - Like taking turns
-```
+1. **`a_application_stage_tracker`** - History table recording every stage change
+2. **`ApplicationStage` enum** - ~150+ predefined stages
+3. **`TriggerServiceImpl`** - Fires events when specific stages are reached
 
-**Key Insight:** Current state = Latest row in history table (not boolean flags)
+### **4.1 The History Table**
 
-### **Visual Metaphor: Building a House**
-
-Think of building a house with multiple contractors:
-
-```
-Foundation Contractor:
-- Dig hole ✅ (is_hole_dug: true)
-- Pour concrete ✅ (is_foundation_done: true)
-
-Frame Contractor:
-- Build walls ✅ (is_frame_done: true)
-- Install roof ⏳ (is_roof_done: false)
-
-Electrical Contractor:
-- Wire first floor ✅ (is_electrical_done: true)
-- Wire second floor ⏳ (is_electrical_done: false)
-```
-
-**Key Insight:**
-- Each task has a **checkbox** (boolean flag)
-- Checkboxes are **independent** (wiring floor 1 doesn't uncheck foundation)
-- Once checked, **never unchecked** (can't un-dig a hole)
-- Completing a task **triggers** the next contractor (dominoes)
-
----
-
-### **Our Database Design:**
-
-**Single Table: Application Stage Tracker (History-Based = Journey Log)**
 ```sql
 CREATE TABLE a_application_stage_tracker (
-    id BIGINT PRIMARY KEY,
-    application_id VARCHAR(255),
-    prev_status VARCHAR(100),
-    current_status VARCHAR(100),
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    application_id VARCHAR(255) NOT NULL,
+    prev_status VARCHAR(100),       -- Previous stage
+    current_status VARCHAR(100),    -- Current stage (from ApplicationStage enum)
     is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMP,
-    updated_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     
     INDEX idx_app_status (application_id, current_status, is_active)
 );
 ```
 
-**Example:**
+### **4.2 Example Data**
+
 ```
-Application APP123 journey:
-┌────┬──────────┬─────────────────┬────────────────────────┬───────────┬─────────────────────┐
-│ ID │ app_id   │ prev_status     │ current_status         │ is_active │ created_at          │
-├────┼──────────┼─────────────────┼────────────────────────┼───────────┼─────────────────────┤
-│ 1  │ APP123   │ NULL            │ APPLICATION_CREATED    │ ✅ true    │ 2026-01-15 10:00:00 │
-│ 2  │ APP123   │ APPLICATION...  │ ELIGIBILITY_SUCCESS    │ ✅ true    │ 2026-01-15 10:05:00 │
-│ 3  │ APP123   │ ELIGIBILITY...  │ AADHAAR_VERIFIED       │ ✅ true    │ 2026-01-15 10:08:00 │
-│ 4  │ APP123   │ AADHAAR_VERI... │ DOCUMENTS_UPLOADED     │ ✅ true    │ 2026-01-15 10:12:00 │
-│ 5  │ APP123   │ DOCUMENTS_UP... │ NACH_MANDATE_SUCCESS   │ ✅ true    │ 2026-01-15 10:20:00 │
-│ 6  │ APP123   │ NACH_MANDATE... │ LMS_CLIENT_SETUP       │ ✅ true    │ 2026-01-15 10:25:00 │
-│ 7  │ APP123   │ LMS_CLIENT...   │ CREATE_LOAN_TL_SUCCESS │ ✅ true    │ 2026-01-15 10:30:00 │ ← Latest (current state)
-└────┴──────────┴─────────────────┴────────────────────────┴───────────┴─────────────────────┘
+Application APP123 Journey:
+┌────┬──────────┬────────────────────────┬────────────────────────────────────────┬───────────┐
+│ ID │ app_id   │ prev_status            │ current_status                         │ is_active │
+├────┼──────────┼────────────────────────┼────────────────────────────────────────┼───────────┤
+│ 1  │ APP123   │ NULL                   │ CREATED                                │ true      │
+│ 2  │ APP123   │ CREATED                │ SOFT_ELIGIBILITY_APPROVED              │ true      │
+│ 3  │ APP123   │ SOFT_ELIGIBILITY...    │ SELFIE_MATCH_SUCCESS                   │ true      │
+│ 4  │ APP123   │ SELFIE_MATCH_...       │ APPLICATION_APPROVED                   │ true      │
+│ 5  │ APP123   │ APPLICATION_APPR...    │ PHASE_ONE_DOCUMENTS_..._SUCCESS        │ true      │
+│ 6  │ APP123   │ PHASE_ONE_DOC_...      │ LMS_CLIENT_SETUP_COMPLETED             │ true      │
+│ 7  │ APP123   │ LMS_CLIENT_SET_...     │ LOAN_REQUEST_SUCCESS                   │ true      │
+└────┴──────────┴────────────────────────┴────────────────────────────────────────┴───────────┘
 ```
 
-**How to Find Current State:**
+### **4.3 Core Queries**
+
 ```sql
--- Get current status (latest row)
-SELECT current_status FROM a_application_stage_tracker
+-- Get current state (latest active row)
+SELECT current_status 
+FROM a_application_stage_tracker
 WHERE application_id = 'APP123' AND is_active = true
-ORDER BY updated_at DESC LIMIT 1;
+ORDER BY updated_at DESC 
+LIMIT 1;
 
--- Result: "CREATE_LOAN_TL_SUCCESS"
+-- Check if specific stage completed
+SELECT COUNT(*) > 0 AS is_completed
+FROM a_application_stage_tracker
+WHERE application_id = 'APP123' 
+  AND current_status = 'APPLICATION_APPROVED'
+  AND is_active = true;
+
+-- Get full journey
+SELECT current_status, created_at
+FROM a_application_stage_tracker
+WHERE application_id = 'APP123'
+ORDER BY created_at;
 ```
-
-**Why This Single-Table Design?**
-
-| Question | Answer |
-|----------|--------|
-| **Current state?** | Latest row: `ORDER BY updated_at DESC LIMIT 1` |
-| **Has KYC completed?** | Check existence: `WHERE current_status = 'AADHAAR_VERIFIED'` |
-| **Full journey?** | All rows: `WHERE application_id = 'APP123' ORDER BY created_at` |
-| **Performance?** | 2ms (indexed on application_id + current_status + is_active) |
-
-**Note:** There's an old `application_state` table in orchestration with boolean flags, but it's **DEPRECATED** (491K rows vs 1.2M applications = not maintained).
 
 ---
 
 ## 5. HOW OUR SYSTEM WORKS (COMPLETE WALKTHROUGH)
 
-Let me walk through a **REAL example** from start to finish: **GPay user applies for a loan**
-
-### **Starting Point:**
-```
-User: "I want a ₹50,000 loan"
-System: "Let me check your eligibility..."
-```
-
----
-
-### **STEP 1: APPLICATION CREATED**
-
-**What Happens:**
-1. User fills form on GPay app
-2. GPay sends request to our Orchestration service
-3. Orchestration validates data
-4. Orchestration creates application in ZipCredit service
-
-**Code:**
-```java
-// UserServiceImpl.java
-public Response createApplication(ApplicationRequest request) {
-    // Save to database
-    ApplicationBean app = applicationDBService.insert(
-        application_id: generateId(),  // APP123
-        name: request.getName(),
-        phone: request.getPhone(),
-        amount: request.getAmount()
-    );
-    
-    // Insert into state table (initialize all flags to false)
-    applicationStateService.create(app.getApplicationId());
-    
-    // Insert into tracker (record this step)
-    applicationStatusServiceImpl.insertApplicationTracker(
-        app.getApplicationId(),
-        tenantId: 1,
-        currentStatus: ApplicationStage.APPLICATION_CREATED
-    );
-    
-    return Response.success("Application created: APP123");
-}
-```
-
-**What Gets Saved:**
-
-**a_application_stage_tracker table:**
-```
-┌────┬──────────┬─────────────────────┬───────────┬─────────────────────┐
-│ ID │ app_id   │ current_status      │ is_active │ created_at          │
-├────┼──────────┼─────────────────────┼───────────┼─────────────────────┤
-│ 1  │ APP123   │ APPLICATION_CREATED │ ✅ true    │ 2026-01-15 10:00:00 │
-└────┴──────────┴─────────────────────┴───────────┴─────────────────────┘
-```
-
----
-
-### **STEP 2: TRIGGER FIRES (The Magic Part!)**
-
-When we inserted `APPLICATION_CREATED` into tracker, **something automatic happens**:
-
-**Inside `insertApplicationTracker()` method:**
-```java
-public boolean insertApplicationTracker(String applicationId, 
-                                       Integer tenantId,
-                                       ApplicationStage currentStatus) {
-    // 1. Save to database (we just did this)
-    saveCurrentStatus(applicationId, tenantId, currentStatus, prevStatus);
-    
-    // 2. TRIGGER PROCESSING (automatic!)
-    processTriggers(applicationId, tenantId, currentStatus, prevStatus);
-    
-    return true;
-}
-```
-
-**What `processTriggers()` does:**
-```java
-private void processTriggers(String applicationId, 
-                            Integer tenantId, 
-                            ApplicationStage currentStatus) {
-    
-    // Look up: "What events should run when APPLICATION_CREATED?"
-    ApplicationBean app = getApplicationDetails(applicationId);
-    String channelCode = app.getChannelCode();  // "GPAY"
-    
-    // Check configuration map
-    List<EventConfig> events = partnerStageEventConfigMap
-        .get("GPAY")                    // Partner: GPay
-        .get(currentStatus);             // Stage: APPLICATION_CREATED
-    
-    // Result: [EventConfig { eventType: ELIGIBILITY_CHECK }]
-    
-    if (events != null) {
-        for (EventConfig eventConfig : events) {
-            // Get the event processor
-            IEventService eventService = eventServiceFactory.get(
-                EventType.ELIGIBILITY_CHECK
-            );
-            
-            // Run in BACKGROUND (non-blocking)
-            CompletableFuture.runAsync(() -> {
-                eventService.process(applicationDetailsDTO);
-            }, eventThreadPoolExecutor);
-        }
-    }
-}
-```
-
-**Configuration Map (Loaded from Database):**
-```
-partnerStageEventConfigMap = {
-    "GPAY": {
-        APPLICATION_CREATED: [ELIGIBILITY_CHECK],
-        ELIGIBILITY_SUCCESS: [AADHAAR_VERIFICATION],
-        AADHAAR_VERIFIED: [DOCUMENT_GENERATION],
-        NACH_MANDATE_SUCCESS: [LMS_CLIENT_SETUP],
-        LMS_CLIENT_SETUP: [CREATE_LOAN_TL],
-        CREATE_LOAN_TL_SUCCESS: [LOAN_DISBURSAL],
-        LOAN_DISBURSAL_SUCCESS: [WEBHOOK_TO_PARTNER]
-    }
-}
-```
-
-**Key Insight:**
-> Triggers are **NOT database triggers**. They are **Java method calls** that happen **immediately** after inserting a stage, in the **same request**.
-
----
-
-### **STEP 3: ELIGIBILITY CHECK EVENT RUNS**
-
-**What Happens (In Background Thread):**
-```java
-// EligibilityCheckEventServiceImpl.java
-public void process(ApplicationDetailsDTO dto) {
-    String applicationId = dto.getApplicationId();
-    
-    // 1. Acquire distributed lock (prevent duplicates)
-    String lockKey = "ELIGIBILITY:" + applicationId;
-    if (!cacheUtility.tryLock(60, lockKey)) {
-        logger.error("Another instance is processing eligibility");
-        return;  // Exit (someone else is doing this)
-    }
-    
-    try {
-        // 2. Check if already completed (idempotency)
-        if (isEligibilityAlreadyDone(applicationId)) {
-            logger.info("Eligibility already done, skipping");
-            return;
-        }
-        
-        // 3. Call BRE (Business Rule Engine)
-        BREResponse breResponse = breService.checkEligibility(
-            applicationId,
-            amount: 50000,
-            phone: "9876543210"
-        );
-        
-        // 4. Call Credit Bureau (CIBIL)
-        CibilResponse cibilResponse = cibilService.getCreditScore(
-            applicationId,
-            panCard: "ABCDE1234F"
-        );
-        
-        // 5. Decide: Eligible or not?
-        if (breResponse.isEligible() && cibilResponse.getScore() > 650) {
-            // ELIGIBLE!
-            
-            // Update state flags
-            applicationStateService.updateFlag(
-                applicationId,
-                "is_eligible",
-                true
-            );
-            
-            // Insert tracker (this will trigger NEXT event!)
-            applicationStatusServiceImpl.insertApplicationTracker(
-                applicationId,
-                tenantId,
-                ApplicationStage.ELIGIBILITY_SUCCESS  // ← Triggers AADHAAR_VERIFICATION
-            );
-        } else {
-            // NOT ELIGIBLE
-            applicationStatusServiceImpl.insertApplicationTracker(
-                applicationId,
-                tenantId,
-                ApplicationStage.ELIGIBILITY_FAILED
-            );
-        }
-        
-    } finally {
-        // 6. Release lock
-        cacheUtility.releaseLock(lockKey);
-    }
-}
-```
-
-**Timeline:**
-```
-10:00:00.000 → User submits application via GPay
-10:00:00.100 → INSERT into tracker: APPLICATION_CREATED
-10:00:00.105 → processTriggers() called (same request)
-10:00:00.110 → CompletableFuture submits ELIGIBILITY_CHECK to thread pool
-10:00:00.115 → API returns to GPay: "Application created: APP123" ✅
-
-(Background thread)
-10:00:00.120 → ELIGIBILITY_CHECK event starts
-10:00:00.125 → Acquire Redis lock: "ELIGIBILITY:APP123"
-10:00:00.130 → Call BRE API (500ms)
-10:00:00.630 → Call CIBIL API (1.5 seconds)
-10:00:02.130 → Decision: ELIGIBLE ✅
-10:00:02.135 → Update application_state: is_eligible = true
-10:00:02.140 → INSERT into tracker: ELIGIBILITY_SUCCESS
-10:00:02.145 → processTriggers() → Submits AADHAAR_VERIFICATION to thread pool
-10:00:02.150 → Release lock
-```
-
-**Key Observations:**
-- ✅ **User got response in 115ms** (didn't wait for eligibility check)
-- ✅ **Eligibility check took 2.15 seconds** (ran in background)
-- ✅ **Next event auto-triggered** when ELIGIBILITY_SUCCESS inserted
-- ✅ **Lock prevented duplicate eligibility checks** across 3 EC2 instances
-
----
-
-### **STEP 4: THE CASCADE CONTINUES...**
+### **5.1 The Key Components**
 
 ```
-ELIGIBILITY_SUCCESS → Triggers AADHAAR_VERIFICATION
-AADHAAR_VERIFIED → Triggers DOCUMENT_GENERATION
-DOCUMENTS_GENERATED → Triggers NACH_MANDATE_CREATION
-NACH_MANDATE_SUCCESS → Triggers LMS_CLIENT_SETUP
-LMS_CLIENT_SETUP → Triggers CREATE_LOAN_TL
-CREATE_LOAN_TL_SUCCESS → Triggers LOAN_DISBURSAL
-LOAN_DISBURSAL_SUCCESS → Triggers WEBHOOK_TO_PARTNER
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         STATE TRACKING ARCHITECTURE                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Component 1: ApplicationStage Enum (~150+ stages)                          │
+│  ├── CREATED, APPLICANT_DETAIL_UPDATED, ...                                  │
+│  ├── SELFIE_MATCH_SUCCESS, APPLICATION_APPROVED, ...                         │
+│  └── LMS_CLIENT_SETUP_COMPLETED, LOAN_REQUEST_SUCCESS, ...                   │
+│                                                                              │
+│  Component 2: a_application_stage_tracker Table (History)                   │
+│  ├── Records every stage change as INSERT (not UPDATE)                       │
+│  ├── Maintains complete audit trail                                          │
+│  └── Current state = Latest row (ORDER BY updated_at DESC LIMIT 1)          │
+│                                                                              │
+│  Component 3: TriggerServiceImpl (Event Firing)                              │
+│  ├── Partner-specific configuration (GPay, Meesho, PhonePe)                 │
+│  ├── Maps: stage → list of events to fire                                    │
+│  └── Fires events async via CompletableFuture + ThreadPoolTaskExecutor       │
+│                                                                              │
+│  Component 4: IEventService Implementations (Business Logic)                 │
+│  ├── PhaseOneDocumentDscAndNotification                                      │
+│  ├── CreateLoanTLEventServiceImpl                                            │
+│  └── PartnerApplicationApprovedCallback, etc.                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Each step follows the same pattern:
-1. **Event runs** (in background thread)
-2. **Acquires lock** (prevents duplicates)
-3. **Checks idempotency** (skip if already done)
-4. **Does the work** (API call, business logic)
-5. **Updates state flag** (mark checkpoint)
-6. **Inserts tracker stage** (records completion)
-7. **Releases lock**
-8. **Triggers next event** (automatically via processTriggers())
+### **5.2 The Flow (Step by Step)**
 
----
-
-### **STEP 5: HANDLING FAILURES**
-
-**What if an event fails?**
-
-**Example: CREATE_LOAN_TL event fails (Finflux API timeout)**
-
-```java
-// CreateLoanTLEventServiceImpl.java
-public void process(ApplicationDetailsDTO dto) {
-    String lockKey = "CREATE_LOAN_TL:" + dto.getApplicationId();
-    
-    try {
-        if (cacheUtility.tryLock(60, lockKey)) {
-            try {
-                // Call LMS API to create loan
-                Response lmsResponse = lmsApiService.createLoan(
-                    applicationId: dto.getApplicationId(),
-                    amount: 50000
-                );
-                
-                if (lmsResponse.isSuccess()) {
-                    // Success! Insert success stage
-                    applicationStatusServiceImpl.insertApplicationTracker(
-                        dto.getApplicationId(),
-                        tenantId,
-                        ApplicationStage.CREATE_LOAN_TL_SUCCESS  // ← Triggers LOAN_DISBURSAL
-                    );
-                } else {
-                    // API returned error
-                    applicationStatusServiceImpl.insertApplicationTracker(
-                        dto.getApplicationId(),
-                        tenantId,
-                        ApplicationStage.CREATE_LOAN_TL_FAILED  // ← Does NOT trigger next event
-                    );
-                    
-                    // Save error details for debugging
-                    eventTrackerService.insert(
-                        applicationId: dto.getApplicationId(),
-                        eventType: "CREATE_LOAN_TL",
-                        status: "FAILED",
-                        data: lmsResponse.getError()
-                    );
-                }
-            } finally {
-                cacheUtility.releaseLock(lockKey);
-            }
-        }
-    } catch (Exception e) {
-        logger.error("CREATE_LOAN_TL event failed", e);
-        // Insert failed stage
-        applicationStatusServiceImpl.insertApplicationTracker(
-            dto.getApplicationId(),
-            tenantId,
-            ApplicationStage.CREATE_LOAN_TL_FAILED
-        );
-    }
-}
+```
+Step 1: Some process completes (e.g., KYC verification)
+        │
+        ▼
+Step 2: Calls ApplicationStatusServiceImpl.insertApplicationTracker()
+        │
+        │  public boolean insertApplicationTracker(String applicationId, 
+        │                                          Integer tenantId,
+        │                                          ApplicationStage currentStatus) {
+        │      // 1. Save to database
+        │      saveCurrentStatus(applicationId, tenantId, currentStatus, prevStatus);
+        │      
+        │      // 2. Process triggers
+        │      processTriggers(applicationId, tenantId, currentStatus, prevStatus);
+        │      
+        │      return true;
+        │  }
+        │
+        ▼
+Step 3: Stage is INSERTed into a_application_stage_tracker
+        │
+        ▼
+Step 4: TriggerServiceImpl.process() is called
+        │
+        │  // Looks up: For this partner + this stage, what events to fire?
+        │  List<EventConfig> events = partnerStageEventConfigMap
+        │      .get(channelCode)   // e.g., "GPAYTL"
+        │      .get(currentStatus); // e.g., APPLICATION_APPROVED
+        │
+        ▼
+Step 5: Each configured event is fired
+        │
+        │  for (EventConfig eventConfig : events) {
+        │      IEventService eventService = eventServiceFactory.get(eventConfig.getEventType());
+        │      
+        │      if (eventConfig.isAsync()) {
+        │          CompletableFuture.runAsync(() -> eventService.process(appDetails), taskExecutor);
+        │      } else {
+        │          eventService.process(appDetails);
+        │      }
+        │  }
+        │
+        ▼
+Step 6: Event service does its work (e.g., generate documents)
+        │
+        ▼
+Step 7: On success, event inserts SUCCESS stage → TRIGGERS NEXT EVENT (cascade!)
 ```
 
-**What Happens:**
+### **5.3 Real Example: GPay Loan Journey**
+
 ```
-Timeline:
-10:30:00 → CREATE_LOAN_TL event starts
-10:30:01 → Call Finflux API: createLoan()
-10:30:15 → Finflux API timeout (503 Service Unavailable)
-10:30:15 → Insert: CREATE_LOAN_TL_FAILED
-10:30:15 → Save error in event_tracker table
-
-Application State:
-┌────────────────────────────────┬─────────┐
-│ is_application_id_created      │ ✅ true  │
-│ is_eligible                    │ ✅ true  │
-│ is_aadhaar_verified            │ ✅ true  │
-│ is_documents_uploaded          │ ✅ true  │
-│ is_nach_registered             │ ✅ true  │
-│ is_loan_created                │ ❌ false │ ← Still false (failed)
-└────────────────────────────────┴─────────┘
-
-Tracker:
-┌────┬──────────┬────────────────────────┬─────────────────────┐
-│ 6  │ APP123   │ LMS_CLIENT_SETUP       │ 2026-01-15 10:25:00 │
-│ 7  │ APP123   │ CREATE_LOAN_TL_FAILED  │ 2026-01-15 10:30:15 │ ← Failure recorded
-└────┴──────────┴────────────────────────┴─────────────────────┘
+APPLICATION_APPROVED is inserted
+    │
+    ├──▶ Triggers: PHASE_ONE_DOCUMENTS_GENERATE_DSC_NOTIFICATION (async)
+    │           │
+    │           ▼ (on success)
+    │    PHASE_ONE_DOCUMENTS_..._SUCCESS is inserted
+    │           │
+    │           └──▶ Triggers: PHASE_TWO_DOCUMENTS... (async)
+    │                       │
+    │                       ▼ (on success)
+    │                PHASE_TWO_DOCUMENTS_..._SUCCESS is inserted
+    │                       │
+    │                       └──▶ Triggers: LMS_CLIENT_SETUP (async)
+    │                                   │
+    │                                   ▼ (on success)
+    │                            LMS_CLIENT_SETUP_COMPLETED is inserted
+    │                                   │
+    │                                   ├──▶ Triggers: CREATE_LOAN_TL (async)
+    │                                   │           │
+    │                                   │           ▼ (on success)
+    │                                   │    LOAN_REQUEST_SUCCESS is inserted
+    │                                   │
+    │                                   └──▶ Triggers: PARTNER_CALLBACK (async)
+    │
+    ├──▶ Triggers: REGISTER_USER_FOR_UCIN (async)
+    │
+    └──▶ Triggers: CREATE_CKYC_UPLOAD_ENTRY (async)
 ```
-
-**Retry Mechanism:**
-
-**Option 1: Manual Retry (Admin Dashboard)**
-```java
-POST /api/v1/admin/retry-event
-{
-    "application_id": "APP123",
-    "event_type": "CREATE_LOAN_TL"
-}
-
-// This calls:
-eventService.process(applicationDetailsDTO);  // Retry the event
-```
-
-**Option 2: Scheduled Retry (Cron Job)**
-```java
-@Scheduled(cron = "0 */10 * * * *")  // Every 10 minutes
-public void retryFailedEvents() {
-    // Find all failed events from last 24 hours
-    List<EventTrackerBean> failedEvents = eventTrackerService.findFailedEvents(
-        since: DateTime.now().minusHours(24),
-        status: "FAILED"
-    );
-    
-    for (EventTrackerBean event : failedEvents) {
-        // Retry event
-        IEventService eventService = eventServiceFactory.get(event.getEventType());
-        eventService.process(event.getApplicationDetails());
-    }
-}
-```
-
-**Option 3: User-Initiated Retry**
-```java
-// User clicks "Resume Application" on GPay
-// GPay sends request to our API
-POST /api/v1/applications/APP123/resume
-
-// We check current state and trigger next pending event
-ApplicationBean app = getApplication("APP123");
-ApplicationStage lastStage = getLatestStage("APP123");
-
-if (lastStage == CREATE_LOAN_TL_FAILED) {
-    // Retry loan creation
-    triggerService.process(
-        prevStage: LMS_CLIENT_SETUP,
-        currentStage: LMS_CLIENT_SETUP,  // Re-trigger from same stage
-        applicationId: "APP123",
-        tenantId: 1
-    );
-}
-```
-
-**Critical Insight: We DON'T Rollback!**
-
-Traditional state machine:
-```
-APPROVED → LOAN_CREATED → (fails) → Rollback to APPROVED ❌
-(Cancel loan, delete records)
-```
-
-Our system:
-```
-NACH_MANDATE_SUCCESS → LMS_CLIENT_SETUP → CREATE_LOAN_TL (fails)
-→ Keep NACH mandate ✅
-→ Keep LMS client ✅
-→ Retry only CREATE_LOAN_TL ✅
-```
-
-**Why?**
-- ✅ **Partial work is valuable** (don't waste NACH registration, it costs money!)
-- ✅ **Failures are often transient** (network timeout, API down temporarily)
-- ✅ **Retry is cheaper** than rollback + redo everything
 
 ---
 
 ## 6. WHY WE CHOSE THIS DESIGN
 
-Let me explain the **reasoning behind each design decision**:
-
-### **Decision 1: Boolean Flags (Instead of Single State Enum)**
-
-**What We Chose:**
-```sql
-is_eligible: true/false
-is_loan_created: true/false
-is_disbursed: true/false
-```
+### **Decision 1: History Table (Instead of Single State)**
 
 **Why?**
+- ✅ **Complete audit trail** - Can see entire journey with timestamps
+- ✅ **Easy debugging** - "When did this app get approved?"
+- ✅ **Compliance** - Regulators can see full history
+- ✅ **Retry-friendly** - Can see what failed and when
 
-**Problem with single state:**
-```
-Scenario: User completes KYC, then needs to upload more documents
-
-Traditional state machine:
-current_state: "KYC_DONE" → "DOCUMENTS_PENDING" → "KYC_DONE" again?
-(Can't represent "KYC is done but documents not uploaded")
-
-With boolean flags:
-is_kyc_done: true
-is_documents_uploaded: false
-(Can represent partial progress!)
-```
-
-**Pros:**
-- ✅ **Flexible queries:** "Find all apps where KYC done but loan not created"
-  ```sql
-  SELECT * FROM application_state 
-  WHERE is_kyc_done = true AND is_loan_created = false;
-  ```
-- ✅ **Idempotent updates:** Setting `is_loan_created = true` twice has same effect (no harm)
-- ✅ **Parallel steps:** Can update multiple flags at once
-  ```java
-  UPDATE application_state SET 
-      is_documents_uploaded = true,
-      is_nach_registered = true
-  WHERE application_id = 'APP123';
-  ```
-
-**Cons:**
-- ❌ **Can't represent order:** Flags don't show "KYC came before documents"
-  - **Solution:** Use tracker table for order (audit trail)
-- ❌ **Can have inconsistent state:** `is_loan_created: false` but `is_disbursed: true`
-  - **Solution:** Application logic enforces dependencies (can't disburse without loan)
+**Trade-off:**
+- ❌ More storage (but cheap)
+- ❌ Slightly slower queries (but indexes help)
 
 ---
 
-### **Decision 2: Separate Tracker Table (Instead of Just Flags)**
+### **Decision 2: Event-Driven Triggers (Instead of Polling)**
 
-**What We Chose:**
-```
-application_state (boolean flags) + a_application_stage_tracker (history)
-```
+**Why?**
+- ✅ **Real-time** - Events fire immediately on stage change
+- ✅ **Loosely coupled** - Adding new events doesn't change existing code
+- ✅ **Configurable** - Partner-specific event mappings
 
-**Why Two Tables?**
-
-**Use Case Analysis:**
-
-| Query | Which Table? | Speed |
-|-------|-------------|-------|
-| "Is loan created?" | application_state | 1ms (index on application_id) |
-| "Find all apps where loan created" | application_state | 10ms (WHERE clause) |
-| "When was NACH completed?" | tracker | 5ms (ORDER BY + LIMIT 1) |
-| "Show full journey" | tracker | 20ms (all rows for app) |
-| "What happened between 10:00-11:00?" | tracker | 50ms (time range scan) |
-
-**Pros:**
-- ✅ **Fast operational queries** (application_state has latest info)
-- ✅ **Complete audit trail** (tracker has every step)
-- ✅ **Separate concerns:** Flags for "what's done", tracker for "when & how"
-
-**Cons:**
-- ❌ **Dual writes:** Must update both tables (but in same transaction, so atomic)
-- ❌ **More storage:** Tracker grows over time (but needed for compliance)
-
----
-
-### **Decision 3: Event-Driven Triggers (Instead of Manual API Calls)**
-
-**What We Chose:**
-```
-Insert stage → Auto-trigger next event (in background)
-```
-
-**Alternative Approach:**
-```
-Each service calls the next service manually:
-eligibilityService.check() → 
-    nachService.createMandate() →
-        loanService.createLoan()
-```
-
-**Why Event-Driven?**
-
-**Problem with manual chaining:**
+**How It Works:**
 ```java
-public Response checkEligibility(String appId) {
-    // Check eligibility
-    boolean eligible = breService.check(appId);
+// In TriggerServiceImpl - each partner has different event mappings
+private List<EventConfig> getGpayTermLoanEventConfigList(Integer tenantId) {
+    List<EventConfig> events = new ArrayList<>();
     
-    if (eligible) {
-        // Now what? Call NACH service?
-        nachService.createMandate(appId);  // ❌ Tight coupling!
+    // When APPLICATION_APPROVED → Generate Phase 1 docs
+    events.add(createEventConfig(null, 
+        ApplicationStage.APPLICATION_APPROVED, true, null,
+        EventType.PHASE_ONE_DOCUMENTS_GENERATE_DSC_NOTIFICATION, "GPAYTL"));
+    
+    // When LMS_CLIENT_SETUP_COMPLETED → Create loan + callback
+    events.add(createEventConfig(null, 
+        ApplicationStage.LMS_CLIENT_SETUP_COMPLETED, true, null,
+        EventType.CREATE_LOAN_TL, "GPAYTL"));
+    events.add(createEventConfig(null, 
+        ApplicationStage.LMS_CLIENT_SETUP_COMPLETED, true, null,
+        EventType.PARTNER_APPLICATION_APPROVED_CALLBACK, "GPAYTL"));
+    
+    return events;
+}
+```
+
+---
+
+### **Decision 3: Async Processing with CompletableFuture**
+
+**Why not Kafka?**
+- We don't need millions of events/second
+- CompletableFuture + ThreadPoolTaskExecutor is simpler
+- Easier to debug (no external service)
+
+**How It Works:**
+```java
+// Most events are async
+if (eventConfig.isAsync()) {
+    CompletableFuture.runAsync(() -> eventService.process(appDetails), taskExecutor);
+}
+```
+
+---
+
+### **Decision 4: Idempotency at Every Layer**
+
+**Why?**
+- Events can be triggered multiple times (retries, race conditions)
+- Must not create duplicate documents, duplicate loans, etc.
+
+**How?**
+```java
+// Inside every event service
+public void process(ApplicationDetailsDTO applicationDetails) {
+    // Layer 1: Check if already completed
+    if (isAlreadyCompleted(applicationId, ApplicationStage.PHASE_ONE_..._SUCCESS)) {
+        logger.info("Already completed, skipping...");
+        return;
+    }
+    
+    // Layer 2: Distributed lock
+    if (redisUtility.tryLock(LOCK_TIMEOUT, "DOC_GEN:" + applicationId)) {
+        try {
+            // Do the work
+            generateDocuments(applicationId);
+        } finally {
+            redisUtility.releaseLock("DOC_GEN:" + applicationId);
+        }
     }
 }
 ```
-
-**Issues:**
-- ❌ **Tight coupling:** Eligibility service knows about NACH service
-- ❌ **Synchronous:** User waits for ALL steps to complete
-- ❌ **Hard to change:** Adding new step requires code changes in multiple places
-- ❌ **No retry:** If NACH fails, eligibility service doesn't know what to do
-
-**With event-driven:**
-```java
-public Response checkEligibility(String appId) {
-    // Check eligibility
-    boolean eligible = breService.check(appId);
-    
-    if (eligible) {
-        // Just insert stage (trigger handles the rest!)
-        insertApplicationTracker(appId, ELIGIBILITY_SUCCESS);
-        // Trigger automatically calls next event based on config
-    }
-}
-```
-
-**Pros:**
-- ✅ **Loose coupling:** Services don't know about each other
-- ✅ **Asynchronous:** Fast API response (work happens in background)
-- ✅ **Configuration-driven:** Change flow by updating config (no code change)
-- ✅ **Retry-friendly:** Failed events can be resubmitted independently
-
-**Cons:**
-- ❌ **Eventual consistency:** Loan might not be created immediately when eligibility completes
-- ❌ **Debugging harder:** Event failures happen in background (need good logging)
-- ❌ **Need monitoring:** Must track event processing lag
-
-**Why We Accepted the Trade-off:**
-- User doesn't care if loan created in 1 second vs 5 seconds (UX is same)
-- Partner APIs are slow (2-5 seconds), blocking would cause timeouts
-- Retry logic is much easier with async events
-
----
-
-### **Decision 4: Distributed Locks (Instead of Database Locks)**
-
-**What We Chose:**
-```java
-// Redisson (Redis) distributed lock
-RLock lock = redissonClient.getLock("CREATE_LOAN:APP123");
-if (lock.tryLock(60, TimeUnit.SECONDS)) {
-    // Process loan creation
-}
-```
-
-**Alternative:**
-```sql
--- Database lock
-BEGIN TRANSACTION;
-SELECT * FROM application WHERE application_id = 'APP123' FOR UPDATE;
--- Process loan creation
-COMMIT;
-```
-
-**Why Distributed Lock?**
-
-**Problem Scenario:**
-```
-3 EC2 instances running ZipCredit service (load balanced)
-
-Request comes in: "Create loan for APP123"
-Load balancer sends to all 3 instances (due to retry)
-
-Instance 1 (10:00:00.100): SELECT * FOR UPDATE → Lock row
-Instance 2 (10:00:00.150): SELECT * FOR UPDATE → BLOCKED (waiting)
-Instance 3 (10:00:00.200): SELECT * FOR UPDATE → BLOCKED (waiting)
-
-Instance 1 processes for 5 seconds...
-Instance 2 & 3 waiting for 5 seconds (wasted resources)
-
-When Instance 1 commits:
-Instance 2 acquires lock → Processes (duplicate loan created!)
-Instance 3 still waiting...
-```
-
-**Issues with DB lock:**
-- ❌ **Contention:** Other instances wait (wasted threads)
-- ❌ **Connection pool exhaustion:** Blocked connections can't serve other requests
-- ❌ **Deadlocks:** Complex queries can deadlock
-- ❌ **Only works within transaction:** Can't hold lock across API calls
-
-**With Redisson:**
-```
-Instance 1 (10:00:00.100): tryLock("CREATE_LOAN:APP123") → SUCCESS
-Instance 2 (10:00:00.150): tryLock("CREATE_LOAN:APP123") → FAIL (returns immediately)
-Instance 3 (10:00:00.200): tryLock("CREATE_LOAN:APP123") → FAIL (returns immediately)
-
-Instance 2 & 3: Log "Another instance processing" and exit (no waiting!)
-Instance 1: Process loan creation, release lock
-```
-
-**Pros:**
-- ✅ **Fast failure:** Other instances know immediately (no waiting)
-- ✅ **Can hold across API calls:** Lock held for entire event (including external API calls)
-- ✅ **Watchdog:** Auto-extends lock if processing takes longer (prevents premature expiry)
-- ✅ **TTL:** Auto-released if instance crashes (prevents permanent lock)
-
-**Cons:**
-- ❌ **Redis dependency:** If Redis down, can't acquire locks (but we accept this)
-- ❌ **No ACID guarantees:** Lock separate from DB transaction (but we use idempotency)
-
----
-
-### **Decision 5: No Rollback/Compensation (Instead, Retry Failed Steps)**
-
-**What We Chose:**
-```
-NACH created → Loan creation fails → Keep NACH, retry loan creation ✅
-```
-
-**Alternative (Saga Compensation):**
-```
-NACH created → Loan creation fails → Cancel NACH ❌
-```
-
-**Why No Rollback?**
-
-**Cost Analysis:**
-```
-NACH mandate registration:
-- Digio API call: ₹5 per mandate
-- User enters bank details (effort)
-- OTP verification (user time)
-
-If loan creation fails (network timeout):
-Traditional approach:
-- Cancel NACH (another ₹5 API call)
-- User has to re-enter bank details
-- New OTP verification
-- Total: ₹10 + bad UX
-
-Our approach:
-- Keep NACH
-- Retry loan creation (free)
-- Total: ₹5 + good UX
-```
-
-**When Failures Are Transient:**
-```
-Failure reasons we see:
-- Network timeout (80%)
-- API rate limit (15%)
-- Temporary service outage (5%)
-
-Permanent failures (rare):
-- Invalid data (<1%)
-- Business rule violation (<1%)
-```
-
-**Pros:**
-- ✅ **Cost savings:** Don't waste money on re-doing steps
-- ✅ **Better UX:** User doesn't have to repeat steps
-- ✅ **Faster recovery:** Retry is instant, rollback + redo takes minutes
-
-**Cons:**
-- ❌ **Orphaned data:** If never retried, NACH exists but no loan (we have cleanup jobs)
-- ❌ **Compensation complexity:** If we DO need to rollback, it's manual (but rare)
 
 ---
 
 ## 7. ALTERNATIVES WE CONSIDERED
 
-Let me explain other approaches we evaluated:
+| Alternative | Why We Didn't Use It |
+|-------------|---------------------|
+| **Camunda/Temporal** | Overkill, learning curve, operational overhead |
+| **AWS Step Functions** | Vendor lock-in, harder to customize |
+| **Kafka Streams** | Infrastructure overhead, not needed for our scale |
+| **Single State Column** | Lost history, hard to debug |
+| **Separate State Service** | Additional latency, more complexity |
 
-### **Alternative 1: AWS Step Functions (Serverless Workflow)**
-
-**What It Is:**
-- AWS managed service for orchestrating workflows
-- Define state machine in JSON
-- Auto-retry, error handling, parallel execution
-
-**Why We Didn't Choose:**
-
-**Pros:**
-- ✅ Visual designer (non-developers can design flows)
-- ✅ Built-in retry logic
-- ✅ Serverless (no infrastructure to manage)
-
-**Cons:**
-- ❌ **Vendor lock-in:** Tied to AWS (we use hybrid cloud)
-- ❌ **Cost:** $0.025 per 1000 state transitions (at our scale: $500/month)
-- ❌ **Latency:** Each step is a separate Lambda invocation (100ms+ overhead)
-- ❌ **Debugging:** Logs scattered across CloudWatch, X-Ray, Step Functions console
-- ❌ **Limited control:** Can't customize retry logic per step
-
-**When It Would Be Better:**
-- ✅ Fully on AWS (not hybrid)
-- ✅ Simple workflows (no complex business logic)
-- ✅ Low volume (<10K applications/month)
-
----
-
-### **Alternative 2: Camunda BPMN Engine**
-
-**What It Is:**
-- Open-source workflow engine
-- Define workflows in BPMN (Business Process Model)
-- Separate service for orchestration
-
-**Why We Didn't Choose:**
-
-**Pros:**
-- ✅ Visual designer (BPMN diagrams)
-- ✅ Rich features (timers, escalations, manual tasks)
-- ✅ Open source (no vendor lock-in)
-
-**Cons:**
-- ❌ **Heavy:** Requires separate Camunda service + database
-- ❌ **Learning curve:** Team needs to learn BPMN (different from Spring Boot)
-- ❌ **Performance:** Each state transition queries Camunda DB (adds latency)
-- ❌ **Overkill:** Our flows are mostly linear (don't need parallel gateways, etc.)
-
-**When It Would Be Better:**
-- ✅ Complex workflows (many parallel branches, loops)
-- ✅ Human tasks (manager approval, manual review)
-- ✅ Long-running processes (weeks/months)
-
----
-
-### **Alternative 3: Apache Kafka + Stream Processing**
-
-**What It Is:**
-- Each stage publishes event to Kafka
-- Consumers process events and trigger next step
-
-**Example:**
-```
-eligibility-complete-topic → [Consumer] → nach-creation-topic
-nach-complete-topic → [Consumer] → loan-creation-topic
-```
-
-**Why We Didn't Choose:**
-
-**Pros:**
-- ✅ **Durable:** Events stored in Kafka (can replay)
-- ✅ **Scalable:** Horizontal scaling of consumers
-- ✅ **Decoupled:** Services completely independent
-
-**Cons:**
-- ❌ **Infrastructure:** Need Kafka cluster (Zookeeper, brokers)
-- ❌ **Complexity:** Need to manage consumer groups, offsets, dead letter queues
-- ❌ **Latency:** Each hop adds 10-50ms (vs 1ms for in-memory queue)
-- ❌ **Debugging:** Need to trace events across topics (correlation ID tracking)
-- ❌ **Overkill:** Our volume (50 events/sec) doesn't need Kafka (CompletableFuture handles it)
-
-**When It Would Be Better:**
-- ✅ High volume (>1000 events/sec)
-- ✅ Multiple consumers for same event (fanout)
-- ✅ Need event replay (audit/debugging)
-- ✅ Cross-service events (different teams own services)
-
----
-
-### **Alternative 4: Database Polling (Scheduled Jobs)**
-
-**What It Is:**
-- Cron job runs every minute
-- Queries: "Find all applications in ELIGIBILITY_SUCCESS state"
-- For each, trigger next step
-
-**Example:**
-```sql
--- Cron job query
-SELECT application_id FROM a_application_stage_tracker 
-WHERE current_status = 'ELIGIBILITY_SUCCESS' 
-AND processed = false;
-```
-
-**Why We Didn't Choose:**
-
-**Pros:**
-- ✅ **Simple:** Just a cron job + SQL query
-- ✅ **No external dependencies:** No Kafka, no Camunda
-
-**Cons:**
-- ❌ **Latency:** Next step runs only when cron fires (1 minute delay)
-- ❌ **DB load:** Polling queries every minute (high load at scale)
-- ❌ **Race conditions:** Multiple cron instances can pick same application
-- ❌ **Not real-time:** User expects instant response (1 minute is too slow)
-
-**When It Would Be Better:**
-- ✅ Batch processing (not real-time)
-- ✅ Low volume (<100 applications/day)
-- ✅ Delays acceptable (background reports, cleanup tasks)
+**Our Choice:** Simple history table + event triggers in Java code
+- ✅ Team already knows Spring Boot
+- ✅ Easy to debug
+- ✅ Complete control over logic
+- ✅ No external dependencies
 
 ---
 
 ## 8. TRADE-OFFS ANALYSIS
 
-Let me summarize the **trade-offs** we made:
+### **What We Gained:**
 
-### **Trade-off 1: Eventual Consistency vs Strong Consistency**
+| Benefit | How |
+|---------|-----|
+| **Full History** | INSERT-based tracking (never UPDATE) |
+| **Easy Debugging** | Query any application's journey in seconds |
+| **Compliance Ready** | Complete audit trail with timestamps |
+| **Retry-Friendly** | Know exactly what failed and when |
+| **Partner-Specific** | Different event configs per partner |
+| **Loosely Coupled** | Add events without changing existing code |
 
-**What We Chose:** Eventual Consistency
+### **What We Traded:**
 
-**What We Gave Up:**
-- ❌ Loan might not be created immediately after eligibility (2-5 second delay)
-- ❌ Can't return loan_id in same API call as eligibility check
-
-**What We Gained:**
-- ✅ Fast API responses (100ms instead of 5 seconds)
-- ✅ Fault isolation (eligibility API doesn't fail if loan service down)
-- ✅ Better scalability (background processing scales independently)
-
-**Real Impact:**
-- User experience: **No impact** (user doesn't notice 5 second delay)
-- Developer experience: **Easier debugging** (failures isolated)
-- Operations: **Better uptime** (one service down doesn't block others)
-
----
-
-### **Trade-off 2: Flexible Schema vs Rigid State Machine**
-
-**What We Chose:** Flexible (boolean flags)
-
-**What We Gave Up:**
-- ❌ Can have inconsistent states (`is_disbursed: true` but `is_loan_created: false`)
-- ❌ No enforced state transitions at DB level
-
-**What We Gained:**
-- ✅ Can query "all apps where KYC done but loan not created" easily
-- ✅ Can handle parallel steps (KYC + credit check at same time)
-- ✅ Easy to add new flags (add column, no schema migration for existing apps)
-
-**Real Impact:**
-- Development speed: **30% faster** (no complex state machine logic)
-- Query performance: **10x faster** (simple WHERE clauses)
-- Maintenance: **Easier** (application logic enforces consistency, not DB)
-
----
-
-### **Trade-off 3: In-Process Async vs Message Queue**
-
-**What We Chose:** In-process (CompletableFuture + Thread Pool)
-
-**What We Gave Up:**
-- ❌ Events lost if instance crashes during processing
-- ❌ No event replay capability
-- ❌ Can't scale event processing separately from API
-
-**What We Gained:**
-- ✅ **Simpler infrastructure** (no Kafka cluster)
-- ✅ **Lower latency** (in-memory queue, no network hop)
-- ✅ **Easier debugging** (all logs in same service)
-
-**Real Impact:**
-- Infrastructure cost: **$500/month saved** (no Kafka)
-- Latency: **50ms faster** per event
-- Lost events: **<0.01%** (acceptable with retry mechanism)
-
-**When We'd Reconsider:**
-- If event volume > 1000/sec (need Kafka for scale)
-- If multiple services need same events (fanout pattern)
-
----
-
-### **Trade-off 4: No Rollback vs Saga Compensation**
-
-**What We Chose:** No rollback (retry failed steps)
-
-**What We Gave Up:**
-- ❌ Orphaned data if never retried (NACH without loan)
-- ❌ Manual cleanup needed for permanent failures
-
-**What We Gained:**
-- ✅ **Cost savings:** ₹5 per application (no duplicate NACH registration)
-- ✅ **Better UX:** User doesn't repeat steps
-- ✅ **Faster recovery:** 2-second retry vs 5-minute redo
-
-**Real Impact:**
-- Cost: **₹50,000/month saved** (10K applications/month)
-- User satisfaction: **20% fewer drop-offs** (users don't abandon)
-- Orphaned data: **0.1%** (cleanup job handles it)
+| Trade-off | Mitigation |
+|-----------|------------|
+| **More Storage** | Storage is cheap; archive old data |
+| **Query Complexity** | Proper indexes; `ORDER BY updated_at DESC LIMIT 1` |
+| **Configuration in Code** | Version controlled; easy to review in PRs |
+| **No Visual Designer** | Developers prefer code; dashboards for monitoring |
 
 ---
 
 ## 9. INTERVIEW Q&A
 
-Here are the questions the interviewer might ask:
-
-### **Q1: Why do you call it a "state machine" if it doesn't follow traditional state machine patterns?**
+### **Q1: "What kind of state machine did you implement?"**
 
 **Answer:**
-> "You're right to call that out! Technically, our system is a **progress tracker with event-driven triggers**, not a traditional finite state machine.
-> 
-> We have **two components:**
-> 1. **Progress tracker** (boolean flags) - Tracks what's completed
-> 2. **Event triggers** (stage-based) - Automates next steps
-> 
-> We call it a 'state machine' because:
-> - It tracks **application states** (eligibility, loan creation, disbursal)
-> - It has **defined transitions** (eligibility → NACH → loan)
-> - It's **deterministic** (same input → same output)
-> 
-> But it's **different** from traditional FSM because:
-> - Multiple flags can be true simultaneously (not one state at a time)
-> - No explicit state enum (flags represent progress)
-> - Monotonic (flags never go back to false)
-> 
-> We chose this hybrid approach because:
-> - Traditional FSM is too rigid for our complex flows (15+ steps with failures)
-> - Boolean flags give us query flexibility (`WHERE is_kyc_done = true`)
-> - Event triggers give us automation (don't need manual orchestration)"
+> "We implemented an **event-driven state tracking system** using a history-based approach:
+>
+> 1. **History Table** (`a_application_stage_tracker`) - Records every stage change as an INSERT, not UPDATE. Current state = latest row.
+>
+> 2. **Event Triggers** (`TriggerServiceImpl`) - When a stage is inserted, we fire configured events. Each partner (GPay, Meesho) has different event mappings.
+>
+> 3. **Cascade Effect** - Events, on success, insert their SUCCESS stage, which triggers the next event. This creates a chain reaction.
+>
+> It's simpler than Camunda/Temporal but gives us full control, complete history, and easy debugging."
 
 ---
 
-### **Q2: How do you ensure consistency between the two tables (application_state and tracker)?**
+### **Q2: "How do you know what stage to trigger next?"**
 
 **Answer:**
-> "Great question! We use **dual writes within a single database transaction**:
-> 
+> "It's **configuration-driven**, not hard-coded transitions.
+>
+> We have a master map: `partnerStageEventConfigMap = Map<channelCode, Map<ApplicationStage, List<EventConfig>>>`.
+>
+> For example, for GPay:
+> - When `APPLICATION_APPROVED` is inserted → Fire `PHASE_ONE_DOCUMENTS...`
+> - When `PHASE_ONE_SUCCESS` is inserted → Fire `PHASE_TWO_DOCUMENTS...`
+> - When `LMS_CLIENT_SETUP_COMPLETED` is inserted → Fire both `CREATE_LOAN_TL` and `PARTNER_CALLBACK`
+>
+> Adding a new event is just adding a line to the config method - no workflow engine needed."
+
+---
+
+### **Q3: "What if the same stage is inserted twice? How do you prevent duplicates?"**
+
+**Answer:**
+> "We have **4 layers of protection**:
+>
+> 1. **Distributed Lock** (Redisson) - Only one instance processes at a time
+> 2. **Idempotency Check** - Check if stage already exists before processing
+> 3. **Smart Retry** - Track partial progress, resume from where it failed
+> 4. **Database Constraint** - Unique constraint as final safeguard
+>
 > ```java
-> @Transactional
-> public boolean insertApplicationTracker(...) {
->     // 1. Update flag in application_state
->     applicationStateService.updateFlag(appId, "is_loan_created", true);
->     
->     // 2. Insert into tracker
->     applicationTrackerService.insert(appId, "CREATE_LOAN_TL_SUCCESS");
->     
->     // Both commit or both rollback (atomic)
+> // Example from PhaseOneDocumentDscAndNotification
+> if (isAlreadyCompleted(appId, ApplicationStage.PHASE_ONE_..._SUCCESS)) {
+>     return; // Skip - already done
 > }
-> ```
-> 
-> **If transaction fails:**
-> - Neither table is updated (rollback)
-> - Retry logic will reprocess
-> - Idempotency checks prevent duplicates
-> 
-> **Additional safety:**
-> - We can rebuild `application_state` from `tracker` table (source of truth)
-> - Scheduled job validates consistency every hour
-> - Alerts if mismatch detected
-> 
-> **Why two tables if tracker is source of truth?**
-> - Performance: `application_state` has latest values (indexed), fast queries
-> - `tracker` has full history (slower queries but complete audit trail)
-> - Different use cases: operational queries (state) vs audit/debugging (tracker)"
+> if (redisUtility.tryLock(LOCK_TIMEOUT, lockKey)) {
+>     // Process safely
+> }
+> ```"
 
 ---
 
-### **Q3: What if an event is processing when the application crashes?**
+### **Q4: "Why didn't you use Camunda or AWS Step Functions?"**
 
 **Answer:**
-> "This is handled by our **3-layer recovery mechanism:**
-> 
-> **Layer 1: Distributed Lock TTL (Automatic)**
-> - When instance crashes, Redis lock auto-expires after 60 seconds
-> - Other instances can then acquire lock and process event
-> 
-> **Layer 2: Event Tracker Status (Detection)**
-> - Before crash, event status = IN_PROGRESS
-> - After 5 minutes, scheduled job detects: "Event started but not completed"
-> - Job resubmits event to queue
-> 
-> **Layer 3: Idempotency Check (Safety)**
-> - When event restarts, first checks: "Is work already done?"
-> - Example: Query DB for loan_id before calling create loan API
-> - If found, skip processing (idempotent)
-> 
-> **Real Example:**
-> ```
-> 10:00:00 → Instance 1 starts CREATE_LOAN_TL event
-> 10:00:01 → Acquires lock, calls Finflux API
-> 10:00:02 → Instance 1 CRASHES (OOM kill) ❌
-> 10:01:00 → Lock expires (TTL reached)
-> 10:05:00 → Recovery job detects stuck event
-> 10:05:01 → Resubmits CREATE_LOAN_TL to queue
-> 10:05:02 → Instance 2 picks up event
-> 10:05:03 → Checks DB: Loan already created? NO
-> 10:05:04 → Calls Finflux API again → SUCCESS ✅
-> ```
-> 
-> **Trade-off we accept:**
-> - Small chance of duplicate API call (if crash happened after API succeeded but before DB save)
-> - Mitigated by: LMS has its own idempotency (won't create duplicate loan)"
+> "We evaluated them, but they were **overkill** for our use case:
+>
+> | Factor | Camunda/Step Functions | Our Solution |
+> |--------|------------------------|--------------|
+> | Learning curve | High (BPMN, new DSL) | Low (Java code) |
+> | Operational overhead | High (separate service) | Low (in-process) |
+> | Customization | Limited | Full control |
+> | Debugging | Harder | Easy (just SQL) |
+>
+> We needed **progress tracking with history**, not complex orchestration. Our solution is simple, the team already knows Spring Boot, and we have complete control."
 
 ---
 
-### **Q4: Why not use a workflow engine like Camunda or Temporal?**
+### **Q5: "How do you handle failures and retries?"**
 
 **Answer:**
-> "We evaluated Camunda and Temporal but chose our custom solution because:
-> 
-> **For our use case:**
-> - Workflows are **mostly linear** (A → B → C), not complex graphs
-> - **High volume** (50K applications/month) - Camunda DB becomes bottleneck
-> - **Spring Boot ecosystem** - Team familiar with CompletableFuture, not BPMN
-> 
-> **Our approach is better for:**
-> - ✅ **Performance:** In-memory event queue (no network hop to Camunda)
-> - ✅ **Simplicity:** Configuration-driven (no separate BPMN designer)
-> - ✅ **Cost:** No Camunda infrastructure ($0 vs $1000/month for managed Temporal)
-> 
-> **Camunda would be better if:**
-> - ✅ Complex workflows (parallel branches, loops, conditional paths)
-> - ✅ Human tasks (manager approval, manual review)
-> - ✅ Visual designer needed (product team designs flows)
-> 
-> **If we outgrow our system:**
-> - Volume > 1M applications/month → Consider Temporal (better scaling)
-> - Multiple product teams → Consider Camunda (visual designer)
-> - Cross-service orchestration → Consider Saga orchestrator library"
-
----
-
-### **Q5: How do you handle long-running processes (weeks/months)?**
-
-**Answer:**
-> "Great question! Our system is optimized for **fast flows (minutes to hours)**. For long-running processes:
-> 
-> **Example: Business loan (manual underwriting takes 2-3 days)**
-> 
-> **What we do:**
-> - Pause workflow after document upload
-> - Insert stage: `MANUAL_REVIEW_PENDING` (no event triggered)
-> - Underwriter reviews application (external system)
-> - When approved, underwriter clicks "Approve" in admin panel
-> - Admin panel calls our API: `POST /api/v1/applications/APP123/manual-review-complete`
-> - We insert stage: `MANUAL_REVIEW_APPROVED` → Triggers next event (loan creation)
-> 
-> **Why this works:**
-> - No resources held during wait (no thread, no lock, no connection)
-> - State is persisted in DB (survives restarts)
-> - Can add reminders (if pending > 24 hours, send alert to underwriter)
-> 
-> **For VERY long processes (months):**
-> - We'd use scheduled jobs to check status
-> - Example: EMI collection (monthly)
-> - Cron job: "Find all loans where EMI due today"
-> - Trigger EMI collection event
-> 
-> **Why not Temporal for this?**
-> - Temporal is designed for long-running workflows (holds state in memory)
-> - But adds complexity (separate service, learning curve)
-> - Our DB-backed approach is simpler for our use case"
-
----
-
-### **Q6: What's your biggest regret with this design? What would you change?**
-
-**Answer:**
-> "Excellent question! Here's what I'd improve:
-> 
-> **Regret 1: Event Ordering Not Enforced Strictly**
-> - Currently, we rely on config map: `LMS_CLIENT_SETUP → CREATE_LOAN_TL`
-> - If someone misconfigures (creates loan before client setup), system breaks
-> - **Better approach:** Declare dependencies explicitly:
->   ```java
->   @Event(CREATE_LOAN_TL)
->   @Requires(stages = [LMS_CLIENT_SETUP, NACH_MANDATE_SUCCESS])
->   public class CreateLoanEvent { ... }
->   ```
-> - Trigger system validates dependencies before firing event
-> 
-> **Regret 2: No Event Versioning**
-> - What if event logic changes (new field added)?
-> - Old events in queue fail with deserialization error
-> - **Better approach:** Version events:
->   ```java
->   CREATE_LOAN_TL_V1 → CREATE_LOAN_TL_V2
->   ```
-> - Maintain both versions during migration
-> 
-> **Regret 3: Hard to Test Event Chains**
-> - Testing full flow requires triggering all events
-> - Slow (takes 30 seconds for complete flow)
-> - **Better approach:** Mock trigger system:
->   ```java
->   @Test
->   public void testLoanCreation() {
->       mockTriggerService.disable();  // Don't fire next events
->       eventService.process(appDetails);
->       // Assert only loan creation happened
->   }
->   ```
-> 
-> **What I would NOT change:**
-> - Boolean flags (flexibility worth the complexity)
-> - No workflow engine (right decision for our scale)
-> - Event-driven triggers (async is essential)"
-
----
-
-### **Q7: How do you handle parallel steps? (e.g., KYC + Credit Check at same time)**
-
-**Answer:**
-> "We handle parallel steps using **multiple event triggers** with **dependency resolution**:
-> 
-> **Example: GPay flow requires both Aadhaar verification AND credit check before proceeding**
-> 
-> **Config:**
+> "We have a **smart retry mechanism**:
+>
+> 1. **Stage Tracking** - When a step fails, we DON'T insert the SUCCESS stage
+> 2. **Retry Detects** - On retry, we check what's already done and resume
+> 3. **Partial Progress** - We track sub-steps (doc generated? DSC applied? notification sent?)
+>
 > ```java
-> partnerStageEventConfigMap = {
->     "GPAY": {
->         ELIGIBILITY_SUCCESS: [
->             EventConfig(AADHAAR_VERIFICATION),  // Trigger 1
->             EventConfig(CREDIT_CHECK)           // Trigger 2
->         ],
->         
->         // Dependent stage (needs both completed)
->         AADHAAR_VERIFIED: [],  // Don't trigger anything yet
->         CREDIT_CHECK_DONE: []  // Don't trigger anything yet
->     }
+> // Smart retry - skip what's already done
+> if (!documentGenerated) {
+>     generateDocument(appId);
+>     documentGenerated = true;
 > }
-> ```
-> 
-> **Dependency Resolution:**
-> ```java
-> dependentStagesMap = {
->     "GPAY": {
->         DOCUMENT_GENERATION: [
->             AADHAAR_VERIFIED,  // Must be completed
->             CREDIT_CHECK_DONE  // Must be completed
->         ]
->     }
+> if (!dscApplied) {
+>     applyDSC(appId);
+>     dscApplied = true;
 > }
-> 
-> // When inserting any stage
-> public void insertApplicationTracker(String appId, ApplicationStage stage) {
->     // ... insert stage ...
->     
->     // Check: Are all dependencies met for next stage?
->     if (areAllDependenciesMet(appId, DOCUMENT_GENERATION)) {
->         triggerService.process(appId, DOCUMENT_GENERATION);
->     }
+> if (!notificationSent) {
+>     sendNotification(appId);
+>     notificationSent = true;
 > }
-> 
-> private boolean areAllDependenciesMet(String appId, ApplicationStage stage) {
->     List<ApplicationStage> dependencies = dependentStagesMap
->         .get(channelCode)
->         .get(stage);
->     
->     for (ApplicationStage dep : dependencies) {
->         if (!isStageCompleted(appId, dep)) {
->             return false;
->         }
->     }
->     return true;
-> }
-> ```
-> 
-> **Timeline:**
-> ```
-> 10:00:00 → ELIGIBILITY_SUCCESS inserted
-> 10:00:01 → Trigger AADHAAR_VERIFICATION (async)
-> 10:00:01 → Trigger CREDIT_CHECK (async, parallel!)
-> 
-> 10:00:05 → AADHAAR_VERIFIED completed
-> 10:00:05 → Check dependencies: CREDIT_CHECK_DONE? NO → Don't trigger yet
-> 
-> 10:00:08 → CREDIT_CHECK_DONE completed
-> 10:00:08 → Check dependencies: AADHAAR_VERIFIED? YES, CREDIT_CHECK_DONE? YES
-> 10:00:08 → Trigger DOCUMENT_GENERATION ✅
-> ```
-> 
-> **This is better than sequential:**
-> - ✅ **Faster:** Both run in parallel (5 seconds total vs 8 seconds sequential)
-> - ✅ **Flexible:** Can add more parallel steps without code change
-> - ✅ **Fault tolerant:** If one fails, other continues"
+> // Only insert SUCCESS when ALL steps complete
+> insertApplicationTracker(appId, tenantId, ApplicationStage.PHASE_ONE_..._SUCCESS);
+> ```"
 
 ---
 
-## 🎯 KEY TAKEAWAYS
+### **Q6: "How do you query current state efficiently?"**
 
-**What To Remember:**
-
-1. **It's Not a Traditional State Machine**
-   - Progress tracker (boolean flags) + Event triggers
-   - Monotonic (never rollback)
-   - Async execution
-
-2. **Triggers Are Method Calls, Not DB Triggers**
-   - Happens in same method as stage insert
-   - Configuration-driven (partner + stage → events)
-   - CompletableFuture for async execution
-
-3. **3-Layer Defense Against Duplicates**
-   - Distributed lock (primary)
-   - Idempotency check (secondary)
-   - DB constraint (last resort)
-
-4. **Design Decisions Were Trade-offs**
-   - Eventual consistency (vs real-time)
-   - In-process async (vs Kafka)
-   - No rollback (vs Saga)
-   - Boolean flags (vs state enum)
-
-5. **Focus on WHY**
-   - "We chose X because Y"
-   - "The trade-off is Z, which we accept because..."
-   - "If I redesigned, I would..."
+**Answer:**
+> "Simple indexed query:
+>
+> ```sql
+> SELECT current_status 
+> FROM a_application_stage_tracker
+> WHERE application_id = 'APP123' AND is_active = true
+> ORDER BY updated_at DESC 
+> LIMIT 1;
+> ```
+>
+> The index on `(application_id, current_status, is_active)` makes this fast. For bulk queries, we can also cache frequently accessed states in Redis."
 
 ---
 
-**⚠️ CRITICAL UPDATE:** Earlier sections mention "boolean flags" - IGNORE THOSE. We use **history table ONLY** (`a_application_stage_tracker`). See `TIDE_CRITICAL_CORRECTION_REAL_STATE_TRACKING.md` for accurate technical details.
+## 📊 QUICK REFERENCE CARD
+
+```
+╔═════════════════════════════════════════════════════════════════════════╗
+║                   STATE MACHINE CHEAT SHEET                              ║
+╠═════════════════════════════════════════════════════════════════════════╣
+║                                                                          ║
+║  ARCHITECTURE:                                                           ║
+║  ├── History table: a_application_stage_tracker (INSERT-based)          ║
+║  ├── Stage enum: ApplicationStage (~150+ stages)                         ║
+║  └── Event triggers: TriggerServiceImpl (partner-specific config)        ║
+║                                                                          ║
+║  HOW IT WORKS:                                                           ║
+║  1. Some process completes                                               ║
+║  2. Calls insertApplicationTracker(appId, tenantId, stage)              ║
+║  3. Stage is INSERTed into history table                                 ║
+║  4. TriggerServiceImpl looks up events for this stage + partner          ║
+║  5. Events fire (async via CompletableFuture)                            ║
+║  6. Events insert SUCCESS stage → triggers next events (cascade)         ║
+║                                                                          ║
+║  KEY QUERIES:                                                            ║
+║  ├── Current state: ORDER BY updated_at DESC LIMIT 1                    ║
+║  ├── Check completed: WHERE current_status = 'X' AND is_active = true   ║
+║  └── Full history: ORDER BY created_at                                   ║
+║                                                                          ║
+║  IDEMPOTENCY (4 layers):                                                 ║
+║  1. Distributed Lock (Redisson)                                          ║
+║  2. Idempotency Check (DB query)                                         ║
+║  3. Smart Retry (track partial progress)                                 ║
+║  4. Database Constraint (unique key)                                     ║
+║                                                                          ║
+║  WHY THIS DESIGN:                                                        ║
+║  ├── Full history & audit trail                                          ║
+║  ├── Easy debugging (just SQL queries)                                   ║
+║  ├── Partner-specific configuration                                      ║
+║  ├── No external dependencies (no Camunda/Kafka)                         ║
+║  └── Team already knows Spring Boot                                      ║
+║                                                                          ║
+╚═════════════════════════════════════════════════════════════════════════╝
+```
+
+---
 
 **Interview Strategy:**
-- Start with business problem (lending application journey)
-- Explain our approach (history-based tracker + events)
-- **Mention:** "Latest row = current state" (not boolean flags)
-- Compare with alternatives (Camunda, Kafka, boolean flags - we chose history)
-- Discuss trade-offs (query performance vs simplicity)
-- Show understanding of edge cases (failures, crashes, duplicates)
-
-Good luck! 🚀
+1. Start with "event-driven state tracking with history table"
+2. Explain the 3 components: history table, stage enum, trigger service
+3. Show cascade: stage inserted → events fire → SUCCESS stage → next events
+4. Mention idempotency (4 layers)
+5. Compare with alternatives: simpler than Camunda, full control
