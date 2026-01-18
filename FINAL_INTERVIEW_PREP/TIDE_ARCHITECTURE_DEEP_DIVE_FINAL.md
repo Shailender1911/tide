@@ -1577,4 +1577,499 @@ Plan:
 
 ---
 
+## 8. MULTI-INSTANCE CONCURRENCY - CRITICAL INTERVIEW TOPIC
+
+### **8.1 Production Deployment Reality**
+
+```
+Our Multi-Instance Setup:
+
+ZipCredit Service:
+├── Instance 1 (EC2/Pod)  ─┐
+├── Instance 2 (EC2/Pod)  ─┼──► Shared zipcredit_db (MySQL)
+└── Instance 3 (EC2/Pod)  ─┘
+                           └──► Shared Redis (Single Instance)
+
+Orchestration Service:
+├── Instance 1 (Pod)  ─┬──► Shared orchestration_db (MySQL)
+└── Instance 2 (Pod)  ─┘
+
+Loan Repayment Service:
+├── Instance 1 (Pod)  ─┐
+├── Instance 2 (Pod)  ─┼──► Shared loan_repayment_db (MySQL)
+└── Instance 3 (Pod)  ─┘
+
+Load Balancer:
+- Requests distributed round-robin across instances
+- No session stickiness
+- Any request can land on any instance
+```
+
+---
+
+### **8.2 The Problem: Duplicate Request Scenario**
+
+```
+Real Scenario: User triggers document generation
+
+Time T1: User clicks "Generate Documents"
+├── Request → Load Balancer → Orchestration Instance 1
+├── Orchestration calls ZipCredit
+└── Request → Load Balancer → ZipCredit Instance 1
+    └── Document generation STARTS (takes 30 seconds)
+
+Time T2 (5 seconds later): User clicks again (impatient)
+├── Request → Load Balancer → Orchestration Instance 2 (different!)
+├── Orchestration calls ZipCredit
+└── Request → Load Balancer → ZipCredit Instance 3 (different!)
+    └── WITHOUT PROTECTION: Duplicate document generated!
+
+Problems without protection:
+❌ Duplicate documents created
+❌ Duplicate API calls to external services (Digio for e-sign)
+❌ Inconsistent state in database
+❌ Wasted resources
+❌ Customer confusion (two documents in email)
+```
+
+---
+
+### **8.3 Our Multi-Layer Protection Strategy**
+
+```
+Layer 1: Distributed Lock (Redis + Redisson)
+├── FIRST defense
+├── Lock acquired using applicationId as key
+├── Only ONE instance can process at a time
+└── Other instances wait or fail fast
+
+Layer 2: Idempotency Check (Database)
+├── SECOND defense
+├── Check a_application_stage_tracker: "Is this already done?"
+├── If status exists & is_active = true → Skip processing
+└── Prevents re-processing even after lock released
+
+Layer 3: State Tracking (a_application_stage_tracker)
+├── THIRD defense
+├── Each step recorded with timestamp
+├── On retry: Check what's already completed
+└── Resume from where it failed, don't restart
+
+Layer 4: Database Unique Constraints
+├── FINAL defense
+├── Unique constraint on (application_id, current_status)
+├── Database rejects duplicate insert
+└── Last line of defense
+```
+
+---
+
+### **8.4 How It Actually Works (Code-Level)**
+
+**Step 1: Distributed Lock Acquisition**
+```java
+// RedisUtility.java - Used by ALL event handlers
+public boolean tryLock(long timeout, String lockKey) {
+    RLock rLock = redissonClient.getLock(lockKey);
+    try {
+        boolean lockStatus = rLock.tryLock(timeout, TimeUnit.SECONDS);
+        if (!lockStatus) {
+            logger.info("Redis Lock failed for key {}", lockKey);
+            return false;  // Another instance is processing this
+        }
+        logger.info("Redis Lock Acquired for key {}", lockKey);
+        return true;
+    } catch (Exception e) {
+        logger.error("Error acquiring lock: {}", e.getMessage());
+        return false;
+    }
+}
+
+// Usage in event handler:
+String lockKey = "CREATE_LOAN_TL_" + applicationId;
+if (cacheUtility.tryLock(60, lockKey)) {  // 60 second timeout
+    try {
+        processCreateLoan(applicationDetails);  // Safe to process
+    } finally {
+        cacheUtility.releaseLock(lockKey);  // Always release
+    }
+} else {
+    logger.error("Another instance is processing applicationId: {}", 
+        applicationId);
+    // Request rejected - no duplicate processing
+}
+```
+
+**Step 2: Idempotency Check**
+```java
+// Before processing any step:
+public void process(ApplicationDetailsDTO applicationDetails) {
+    // Check if already processed
+    if (checkApplicationTrackerStatus(
+            applicationDetails.getApplicationId(),
+            applicationDetails.getTenantId(),
+            ApplicationStage.DOCUMENT_GENERATED_SUCCESS)) {
+        
+        logger.info("Document already generated for appId: {}, skipping",
+            applicationDetails.getApplicationId());
+        return;  // IDEMPOTENT - don't process again
+    }
+    
+    // Safe to proceed
+    generateDocuments(applicationDetails);
+}
+
+// The check queries database:
+SELECT COUNT(*) FROM a_application_stage_tracker
+WHERE application_id = ?
+AND current_status = 'DOCUMENT_GENERATED_SUCCESS'
+AND is_active = true;
+```
+
+**Step 3: State Tracking**
+```java
+// After successful processing, insert state:
+applicationStatusService.insertApplicationTracker(
+    applicationId, 
+    tenantId, 
+    ApplicationStage.DOCUMENT_GENERATED_SUCCESS
+);
+
+// This inserts into a_application_stage_tracker:
+INSERT INTO a_application_stage_tracker (
+    application_id,
+    current_status,
+    previous_status,
+    is_active,
+    created_at
+) VALUES (?, 'DOCUMENT_GENERATED_SUCCESS', ?, true, NOW());
+```
+
+---
+
+### **8.5 Complete Flow: Document Generation Example**
+
+```
+Request 1: User clicks "Generate Documents"
+│
+├─► Orchestration Instance 1 receives request
+│   └─► Calls ZipCredit POST /api/v4/documents/generate
+│
+├─► Load Balancer → ZipCredit Instance 1
+│   │
+│   ├─► Step 1: Acquire Redis Lock
+│   │   └─► Lock Key: "DOC_GEN_APP123"
+│   │   └─► Result: Lock ACQUIRED ✓
+│   │
+│   ├─► Step 2: Idempotency Check
+│   │   └─► Query: Is DOCUMENT_GENERATED_SUCCESS active?
+│   │   └─► Result: NO (not yet generated)
+│   │
+│   ├─► Step 3: Generate Documents (takes 30 seconds)
+│   │   └─► Call Digio for e-sign
+│   │   └─► Generate PDFs
+│   │   └─► Upload to S3
+│   │
+│   ├─► Step 4: Insert State
+│   │   └─► INSERT DOCUMENT_GENERATED_SUCCESS
+│   │
+│   └─► Step 5: Release Lock
+│       └─► Lock Released ✓
+│
+└─► Response: 200 OK
+
+
+Request 2: User clicks again (5 seconds later)
+│
+├─► Orchestration Instance 2 receives request
+│   └─► Calls ZipCredit POST /api/v4/documents/generate
+│
+├─► Load Balancer → ZipCredit Instance 3
+│   │
+│   ├─► Step 1: Acquire Redis Lock
+│   │   └─► Lock Key: "DOC_GEN_APP123"
+│   │   └─► Result: Lock FAILED ✗ (Instance 1 holds it)
+│   │
+│   └─► Response: 409 Conflict / Retry Later
+│       └─► "Document generation already in progress"
+
+OR (if Request 2 comes AFTER Request 1 completes):
+
+├─► Load Balancer → ZipCredit Instance 2
+│   │
+│   ├─► Step 1: Acquire Redis Lock
+│   │   └─► Result: Lock ACQUIRED ✓
+│   │
+│   ├─► Step 2: Idempotency Check
+│   │   └─► Query: Is DOCUMENT_GENERATED_SUCCESS active?
+│   │   └─► Result: YES (already exists!)
+│   │
+│   ├─► Step 3: Skip Processing
+│   │   └─► Log: "Already generated, skipping"
+│   │
+│   └─► Step 4: Release Lock
+│       └─► Return existing document URL
+│
+└─► Response: 200 OK (returns existing document)
+```
+
+---
+
+### **8.6 Interview Cross-Questions & Answers**
+
+---
+
+#### **Q1: "How do you prevent duplicate processing when multiple instances receive the same request?"**
+
+**Your Answer:**
+> "We use a **4-layer defense strategy**:
+>
+> **Layer 1: Distributed Locking (Redisson + Redis)**
+> - Every critical operation acquires a Redis lock using `applicationId` as key
+> - Lock timeout: 60 seconds (for document generation)
+> - If another instance has the lock, request is rejected immediately
+>
+> **Layer 2: Idempotency Check**
+> - Before processing, we check `a_application_stage_tracker`
+> - If the step is already completed (status exists & is_active=true), we skip
+>
+> **Layer 3: State Machine**
+> - Every completed step is recorded in the database
+> - On retry, we know exactly what's done and what's pending
+>
+> **Layer 4: Database Constraints**
+> - Unique constraint as final safeguard
+> - Even if all else fails, DB rejects duplicate inserts
+>
+> **Real example:** Document generation request hits Instance 1, acquires lock. Same request (duplicate) hits Instance 3, fails to acquire lock, returns immediately. No duplicate processing."
+
+---
+
+#### **Q2: "What happens if an instance crashes while holding the lock?"**
+
+**Your Answer:**
+> "Great edge case! We handle this with **lock timeouts**:
+>
+> ```
+> Scenario: Instance 1 acquires lock → crashes before releasing
+> 
+> Solution:
+> 1. Redisson locks have automatic expiry (lease time)
+> 2. Default: 30 seconds (configurable per operation)
+> 3. After timeout, lock auto-releases
+> 4. Next instance can acquire and continue
+> ```
+>
+> **But what about partial work?**
+> ```
+> If Instance 1 crashed mid-document-generation:
+> 1. Lock expires after 30 seconds
+> 2. Instance 2 acquires lock
+> 3. Idempotency check: Was document actually generated?
+>    - If YES: Skip (return existing)
+>    - If NO: Retry from scratch
+> 4. State machine tells us exactly what completed
+> ```
+>
+> **Key insight:** Lock timeout + idempotency + state tracking = safe recovery."
+
+---
+
+#### **Q3: "Why Redis for locking? Why not database locks?"**
+
+**Your Answer:**
+> "Good question! We evaluated both:
+>
+> **Option 1: Database Locks (SELECT FOR UPDATE)**
+> ```
+> Pros:
+> - No extra infrastructure
+> - Transactional with data
+> 
+> Cons:
+> - Connection pool exhaustion (long-running operations)
+> - Doesn't work across databases (ZipCredit DB vs Orchestration DB)
+> - Row-level locks can cause deadlocks
+> - Can't lock application_id that doesn't exist yet
+> ```
+>
+> **Option 2: Redis Locks (Redisson) ← What we use**
+> ```
+> Pros:
+> - Sub-millisecond lock acquisition
+> - Works across all services (shared Redis)
+> - No database connection blocking
+> - Built-in timeout and auto-release
+> - Can lock any key (even before DB record exists)
+> 
+> Cons:
+> - Extra infrastructure (Redis)
+> - Not transactional with DB (but we handle with idempotency)
+> ```
+>
+> **Decision:** Redis wins for distributed locking because:
+> 1. ZipCredit instances share Redis (already have it for caching)
+> 2. Document generation takes 30+ seconds (can't hold DB connection)
+> 3. Cross-service locking possible (Orchestration can check ZipCredit lock)
+> "
+
+---
+
+#### **Q4: "What if Redis itself goes down?"**
+
+**Your Answer:**
+> "Critical question! Here's our approach:
+>
+> **Current setup:** Single Redis instance (not cluster)
+>
+> **If Redis goes down:**
+> ```
+> 1. Lock acquisition fails
+> 2. We have a FALLBACK: Local in-memory locks (JavaUtility)
+> 3. CacheUtilityFactory decides which to use:
+>    - If Redis enabled for tenant → Use Redis lock
+>    - If Redis down/disabled → Fall back to local lock
+> ```
+>
+> **Code:**
+> ```java
+> CacheType cacheType = isRedisLockEnabled(tenantId) 
+>     ? CacheType.REDIS 
+>     : CacheType.LOCAL;
+> CacheUtility cacheUtility = cacheUtilityFactory.getCacheUtility(cacheType);
+> ```
+>
+> **Limitation of local locks:**
+> - Only works within same JVM (instance)
+> - Cross-instance protection lost
+>
+> **Mitigation:**
+> - Idempotency check still works (database is up)
+> - Worst case: Duplicate attempt, but caught by idempotency
+>
+> **Future improvement:** Redis Sentinel or Cluster for HA."
+
+---
+
+#### **Q5: "How do you handle the scenario where Orchestration and ZipCredit both need to ensure idempotency?"**
+
+**Your Answer:**
+> "Each service handles its own idempotency:
+>
+> **Orchestration Layer:**
+> ```
+> Responsibility:
+> - Deduplicate partner requests
+> - Store webhook details (WebhookDetails table)
+> - Check: Is this callback already processed?
+> 
+> How:
+> - Unique key: (applicationId, eventType, webhookId)
+> - Before processing: Check if webhook exists
+> - If exists: Return cached response
+> ```
+>
+> **ZipCredit Layer:**
+> ```
+> Responsibility:
+> - Deduplicate internal operations
+> - Distributed lock for concurrent requests
+> - State machine for completed steps
+> 
+> How:
+> - Lock key: operation_type + applicationId
+> - Before processing: Check a_application_stage_tracker
+> - If completed: Skip and return success
+> ```
+>
+> **Flow Example:**
+> ```
+> Partner sends callback twice:
+> 
+> Request 1:
+> Orchestration → Webhook not in DB → Process → Call ZipCredit
+> ZipCredit → Lock acquired → Idempotency check (new) → Process → Done
+> 
+> Request 2 (duplicate):
+> Orchestration → Webhook EXISTS in DB → Return cached response
+> ZipCredit never called!
+> 
+> OR if Request 2 somehow reaches ZipCredit:
+> ZipCredit → Lock acquired → Idempotency check (EXISTS) → Skip → Return
+> ```
+>
+> **Key insight:** Defense in depth. Both layers check, so even if one fails, other catches it."
+
+---
+
+#### **Q6: "What metrics do you track for this concurrency control?"**
+
+**Your Answer:**
+> "We track several metrics:
+>
+> **Lock Metrics:**
+> ```
+> - lock_acquisition_success_count
+> - lock_acquisition_failed_count (shows contention)
+> - lock_wait_time_ms (p50, p95, p99)
+> - lock_hold_time_ms
+> ```
+>
+> **Idempotency Metrics:**
+> ```
+> - idempotency_skip_count (how often we skip due to already done)
+> - duplicate_request_count
+> ```
+>
+> **Alerts:**
+> ```
+> - If lock_failed_count > 100 in 5 min → High contention alert
+> - If idempotency_skip_count spikes → Possible duplicate storm
+> - If lock_hold_time > 60s → Long-running operation alert
+> ```
+>
+> **We use:** Micrometer → Prometheus → Grafana dashboards"
+
+---
+
+### **8.7 Quick Reference Card - Concurrency Control**
+
+```
+╔══════════════════════════════════════════════════════════════════╗
+║             MULTI-INSTANCE CONCURRENCY CHEAT SHEET                ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                    ║
+║  DEPLOYMENT:                                                       ║
+║  ├── ZipCredit: 3 instances → 1 DB + 1 Redis                      ║
+║  ├── Orchestration: 2 instances → 1 DB                            ║
+║  └── Loan Repayment: 3 instances → 1 DB                           ║
+║                                                                    ║
+║  PROTECTION LAYERS:                                                ║
+║  1. Distributed Lock (Redisson) → Prevents concurrent execution   ║
+║  2. Idempotency Check (DB) → Prevents re-processing               ║
+║  3. State Machine → Tracks progress, enables resume               ║
+║  4. DB Unique Constraint → Final safeguard                        ║
+║                                                                    ║
+║  LOCK KEY PATTERN:                                                 ║
+║  └── "{OPERATION_TYPE}_{APPLICATION_ID}"                          ║
+║      Example: "DOC_GEN_APP12345", "CREATE_LOAN_TL_APP12345"       ║
+║                                                                    ║
+║  TIMEOUT STRATEGY:                                                 ║
+║  ├── Quick operations: 10-30 seconds                              ║
+║  ├── Document generation: 60 seconds                              ║
+║  └── External API calls: 30 seconds                               ║
+║                                                                    ║
+║  IF LOCK FAILS:                                                    ║
+║  └── Return immediately (don't queue, don't wait)                 ║
+║  └── Client can retry after timeout                               ║
+║                                                                    ║
+║  IF REDIS DOWN:                                                    ║
+║  └── Fallback to local locks (same instance only)                 ║
+║  └── Idempotency check still protects                             ║
+║                                                                    ║
+╚══════════════════════════════════════════════════════════════════╝
+```
+
+---
+
 **Document Complete! Ready for deep architecture discussions in your final interview.** 🚀
