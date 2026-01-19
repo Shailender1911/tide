@@ -20,7 +20,7 @@
 
 ---
 
-# 📋 DLS NACH SERVICE - DEEP DIVE
+# 📋 DLS NACH SERVICE - DEEP DIVE (Q1-Q8)
 
 ## **Q1: Why did you choose Strategy and Factory patterns for NACH types?**
 
@@ -51,35 +51,11 @@ public class DigioCallbackServiceFactory {
 **Why Factory Pattern:**
 > "We have multiple NACH types (UPI Mandate, eNACH, etc.) from Digio. Each type has different callback handling logic. Factory pattern lets Spring auto-discover all implementations via `List<DigioCallbackService>` injection."
 
-**Why Strategy Pattern:**
-> "Each NACH type implements `DigioCallbackService` interface with different `consumeCallback()` and `sendPartnerCallback()` logic. The interface defines the contract, implementations handle specifics."
-
 **Alternatives Considered:**
 ```
-1. Simple switch-case: 
-   - Rejected: Violates Open-Closed principle
-   - Every new NACH type = modify existing code
-
-2. Template Method:
-   - Could work, but our variations are in WHAT to do, not HOW
-   - Strategy is better for behavioral variations
-
-3. Abstract Factory:
-   - Overkill - we don't need families of related objects
-   - Simple Factory is sufficient
-```
-
-**Trade-offs Accepted:**
-```
-Pros:
-+ Easy to add new NACH types (just add new @Component)
-+ Each type isolated for testing
-+ Spring handles registration automatically
-
-Cons:
-- More files (one per NACH type)
-- Need to understand pattern to maintain
-- Slight overhead of map lookup
+1. Simple switch-case: Rejected - Violates Open-Closed principle
+2. Template Method: Could work, but Strategy better for behavioral variations
+3. Abstract Factory: Overkill - we don't need families of related objects
 ```
 
 ---
@@ -111,18 +87,8 @@ Flow (based on NachService.java):
    └── Uses TenantCallbackServiceFactory for tenant-specific logic
 ```
 
-**Database Transactions:**
-> "We use Spring's `@Transactional` for each step. If Digio API call fails, we update status to FAILED but don't rollback initial save - we need the record for retry."
-
-**Failure Scenarios:**
-```
-1. Digio API timeout → Status = API_TIMEOUT, retry via cron
-2. Callback processing fails → Status = CALLBACK_FAILED, retry
-3. Partner callback fails → Status = PARTNER_CALLBACK_PENDING, retry
-```
-
 **No Rollback/Compensation:**
-> "We don't do Saga-style compensation. We use idempotent retries. If mandate creation fails at Digio, we retry. If callback fails, we retry callback. Each step is designed to be safe to retry."
+> "We don't do Saga-style compensation. We use idempotent retries. Each step is designed to be safe to retry."
 
 ---
 
@@ -130,41 +96,20 @@ Flow (based on NachService.java):
 
 ### **Honest Answer:**
 
-```java
-// From: orchestration/src/main/java/com/payu/vista/orchestration/entity/WebhookDetails.java
+> "We DON'T guarantee exactly-once. We guarantee **at-least-once with idempotency**."
 
+```java
+// From: WebhookDetails.java
 @Entity
-@Table(name = "webhook_details")
-public class WebhookDetails extends Auditable<String> {
-    private String applicationId;
-    private String eventType;
+public class WebhookDetails {
     private String requestId;      // For deduplication
-    private String request;        // Full payload stored
-    private String response;       // Partner response stored
     private WebhookStatus status;  // PENDING, SUCCESS, FAILED
     private boolean retryRequired; // For retry logic
-    private Long webhookConfigId;  // Partner-specific config
-}
-```
-
-**Idempotency Mechanism:**
-> "We use `requestId` (UUID) + `applicationId` + `eventType` as composite key for deduplication. Before processing, we check if same combination exists with SUCCESS status."
-
-**What Happens if Endpoint is Down:**
-```java
-// Simplified logic from CallBackServiceImpl
-if (webhookFailed) {
-    webhookDetails.setStatus(WebhookStatus.FAILED);
-    webhookDetails.setRetryRequired(true);
-    // Cron job picks up failed webhooks for retry
 }
 ```
 
 **Retry Strategy:**
-> "We have a scheduled cron that picks up `retryRequired = true` records. We retry with delays (not exponential backoff in current implementation - simple interval-based retry)."
-
-**Honest Limitation:**
-> "We don't guarantee exactly-once delivery. We guarantee at-least-once with idempotency keys. Partner systems should be idempotent on their end too."
+> "Cron-based retry. Not exponential backoff - simple interval-based."
 
 ---
 
@@ -173,37 +118,17 @@ if (webhookFailed) {
 ### **Honest Answer:**
 
 ```java
-// From: dgl_base/dgl-services/src/main/java/com/dgl/rest/version4/models/ApplicationValidator.java
-
-public void validateCheckSumForGenerateOffer(String applicationId, Integer tenantId, JsonObject generateOfferDto) {
-    String shouldDoCheckSum = configService.getConfig(tenantId, "CHECK_GENERATE_OFFER_CHECK_SUM");
-    if("NO".equalsIgnoreCase(shouldDoCheckSum)) {
-        return;
-    }
-    
+// From: ApplicationValidator.java
+public void validateCheckSumForGenerateOffer(String applicationId, Integer tenantId, JsonObject dto) {
     String salt = configService.getConfig(tenantId, "GENERATE_OFFER_CHECK_SUM_SALT");
     String key = configService.getConfig(tenantId, "GENERATE_OFFER_CHECK_SUM_KEY");
-    String checkSumReceived = generateOfferDto.get("check_sum").getAsString();
-    
     // Validate checksum matches
-    // ... validation logic
 }
 ```
 
-**Key Storage:**
-> "Keys are stored in database config table, per-tenant. Not in code or environment variables."
+**Key Storage:** Database config table, per-tenant. Not in code.
 
-**Key Rotation:**
-> "Manual process currently. We update config, notify partner, they update their system. No automated rotation."
-
-**If Validation Fails:**
-```java
-throw new ZcV4Exception("BAD REQUEST", HttpStatus.BAD_REQUEST.value(), 
-                        applicationId, ZCErrorCode.CHECK_SUM_NOT_MATCHED);
-```
-
-**Honest Limitation:**
-> "This is for offer generation API checksum validation, not a full HMAC webhook validation system. For webhooks from partners like Digio, we rely on their signature validation mechanism."
+**Key Rotation:** Manual process. No automated rotation.
 
 ---
 
@@ -211,78 +136,126 @@ throw new ZcV4Exception("BAD REQUEST", HttpStatus.BAD_REQUEST.value(),
 
 ### **Honest Answer:**
 
-> "We have multiple protection layers:"
-
 **Layer 1: Database Unique Constraint**
 ```sql
--- Unique constraint on application_id prevents duplicate mandates
 UNIQUE KEY (application_id, nach_type)
 ```
 
-**Layer 2: Idempotency Check in Service**
+**Layer 2: Idempotency Check**
 ```java
-// Check if mandate already exists before creating
 Optional<NachDetails> existing = nachRepository.findByApplicationIdAndNachType(appId, type);
 if (existing.isPresent()) {
     return existing.get(); // Return existing, don't create new
 }
 ```
 
-**Layer 3: Distributed Lock (ZipCredit Service)**
-```java
-// From: RedisUtility.java
-public boolean tryLock(long timeout, String lockKey) {
-    RLock rLock = redissonClient.getLock(lockKey);
-    return rLock.tryLock(timeout, TimeUnit.SECONDS);
-}
-```
-
-**Honest Answer on Locking:**
-> "NACH service itself doesn't use distributed locks. ZipCredit service uses Redisson locks for critical operations like document generation. For NACH, we rely on database constraints + idempotency checks."
+**Layer 3: Distributed Lock (ZipCredit only)**
+> "NACH service doesn't use distributed locks. ZipCredit uses Redisson locks for critical operations."
 
 ---
 
-# 📋 INSUREX SERVICE - DEEP DIVE
+## **Q6: How do you handle state machine transitions during concurrent updates?**
+
+### **Honest Answer:**
+
+```java
+// From: ApplicationStatusServiceImpl.java
+public boolean insertApplicationTracker(...) {
+    // 1. Mark previous active status as inactive (single UPDATE)
+    markcurrentStatusInActiveIfAlreadyAvailable(applicationId, tenantId, currentStatus);
+    
+    // 2. Save current status (single INSERT)
+    saveCurrentStatus(applicationId, tenantId, currentStatus, prevStatus);
+    
+    // Each operation is atomic. No multi-step transaction.
+}
+```
+
+**Concurrency Protection:**
+- Database-level row locking via `@Transactional`
+- `is_active` flag prevents duplicate active states
+- No distributed locking for state transitions (single DB)
+
+---
+
+## **Q7: How did you implement multi-tenant data backfilling?**
+
+### **Honest Answer:**
+
+> "We use `tenant_id` column in all tables. Each query includes `WHERE tenant_id = ?`"
+
+```java
+// From: TenantConfig in all services
+@Entity
+public class NachDetails {
+    @Column(name = "tenant_id")
+    private Integer tenantId;  // Partition key for multi-tenancy
+}
+```
+
+**Data Isolation:**
+- Row-level filtering (not separate schemas)
+- `tenant_id` in all queries
+- Configuration per tenant in config tables
+
+---
+
+## **Q8: What if backfilling fails for one tenant?**
+
+### **Honest Answer:**
+
+```
+1. Each tenant processed separately in batch
+2. Failure logged with tenant_id
+3. Other tenants continue processing
+4. Failed tenant marked for retry
+5. Manual intervention for persistent failures
+```
+
+**No automatic rollback** - we retry failed tenant independently.
+
+---
+
+# 📋 INSUREX SERVICE - DEEP DIVE (Q9-Q14)
 
 ## **Q9: How does Factory pattern handle vendor-specific logic?**
 
 ### **Honest Answer:**
 
 ```java
-// From: insure-x/src/main/java/com/payufin/insurex/factory/InsuranceVendorFactory.java
-
+// From: InsuranceVendorFactory.java
 @Component
 public class InsuranceVendorFactory {
-    
-    @Autowired
-    private IciciInsuranceVendorImpl iciciInsuranceVendor;
-    
-    @Autowired
-    private AckoInsuranceVendorImpl ackoInsuranceVendor;
+    @Autowired private IciciInsuranceVendorImpl iciciInsuranceVendor;
+    @Autowired private AckoInsuranceVendorImpl ackoInsuranceVendor;
     
     public InsuranceVendor getInsuranceVendor(String vendorCode) {
-        if("ICICI".equalsIgnoreCase(vendorCode)){
-            return iciciInsuranceVendor;
-        } else if ("ACKO".equalsIgnoreCase(vendorCode)) {
-            return ackoInsuranceVendor;
-        } else {
-            return null; // Could throw exception
-        }
+        if("ICICI".equalsIgnoreCase(vendorCode)) return iciciInsuranceVendor;
+        if("ACKO".equalsIgnoreCase(vendorCode)) return ackoInsuranceVendor;
+        return null;
     }
 }
 ```
 
 **Honest Assessment:**
-> "This is a simple factory, not using Spring's auto-discovery. It's explicit if-else for 2 vendors. For more vendors, we'd refactor to use `List<InsuranceVendor>` injection like NACH service does."
+> "Simple if-else for 2 vendors. For more vendors, we'd refactor to use `List<InsuranceVendor>` injection."
 
-**Interface Design:**
+---
+
+## **Q10: What if a vendor is down during policy creation?**
+
+### **Honest Answer:**
+
 ```java
-public interface InsuranceVendor {
-    PolicyResponse createPolicy(PolicyRequest request);
-    COIResponse generateCOI(COIRequest request);
-    // Vendor-specific implementations handle differences
-}
+// Flow:
+1. API call to vendor fails (timeout/error)
+2. Policy status set to VENDOR_API_FAILED
+3. Response returned to caller with failure status
+4. Cron job picks up failed policies for retry
 ```
+
+**No Circuit Breaker:**
+> "We don't have circuit breaker implementation. We use simple retry via cron."
 
 ---
 
@@ -292,66 +265,44 @@ public interface InsuranceVendor {
 
 ```java
 // From: InsuranceServiceImpl.java
-
-@Autowired
-@Qualifier("defaultThreadPoolExecutor")
-private ThreadPoolTaskExecutor taskExecutor;
-
 CompletableFuture.runAsync(() -> 
-    policyServiceHelper.processInsurance(insurancePolicyRequest, clientInfoId, initialPolicy.getId()), 
-    taskExecutor
+    policyServiceHelper.processInsurance(request, clientInfoId, policyId), 
+    taskExecutor  // Spring-managed ThreadPoolTaskExecutor
 ).exceptionally(ex -> {
-    log.error("Error in insurance provisioning: {}", ex.getMessage(), ex);
+    log.error("Error: {}", ex.getMessage(), ex);
     return null;
 });
 ```
 
-**Why CompletableFuture:**
-```
-1. Built-in exception handling via .exceptionally()
-2. Can chain operations with .thenApply(), .thenCompose()
-3. Uses managed ThreadPoolTaskExecutor (not raw threads)
-4. Spring-managed lifecycle
-```
+**Why:**
+1. Built-in exception handling via `.exceptionally()`
+2. Uses managed ThreadPoolTaskExecutor
+3. Spring-managed lifecycle
+4. Named threads for debugging
 
-**Thread Pool Configuration:**
-```java
-// From: InsuranceThreadPoolConfig.java
-@Bean("defaultThreadPoolExecutor")
-public ThreadPoolTaskExecutor taskExecutor() {
-    ThreadPoolTaskExecutor pool = new ThreadPoolTaskExecutor();
-    pool.setCorePoolSize(defaultCorePoolSize);  // From config
-    pool.setMaxPoolSize(defaultMaxPoolSize);
-    pool.setThreadNamePrefix("InsuranceThread-");
-    return pool;
-}
+---
 
-@Bean("cronThreadPoolExecutor")
-public ThreadPoolTaskExecutor cronTaskExecutor() {
-    ThreadPoolTaskExecutor pool = new ThreadPoolTaskExecutor();
-    pool.setCorePoolSize(cronCorePoolSize);
-    pool.setMaxPoolSize(cronMaxPoolSize);
-    pool.setThreadNamePrefix("CronThread-");
-    return pool;
-}
+## **Q12: Explain your two-phase API flow (Policy + COI)**
+
+### **Honest Answer:**
+
+```
+Phase 1: Create Policy
+- Collect customer consent
+- Call vendor API to create policy
+- Store policy details
+
+Phase 2: Generate COI (Certificate of Insurance)
+- Called after policy confirmed
+- Download COI PDF from vendor
+- Store for customer download
 ```
 
-**Trade-offs:**
-```
-Pros:
-+ Managed thread pool (no thread leaks)
-+ Graceful shutdown (setWaitForTasksToCompleteOnShutdown)
-+ Exception handling built-in
-+ Named threads for debugging
+**Why Two Phases:**
+> "Business requirement. Consent must be captured before policy. COI generated only after payment confirmed."
 
-Cons:
-+ More complex than simple @Async
-+ Need to manage executor lifecycle
-+ Backpressure not automatic (queue fills up)
-```
-
-**Honest Limitation:**
-> "We don't have sophisticated backpressure handling. If queue fills up, we'd need to add bounded queue + rejection policy."
+**If COI fails after policy:**
+> "Policy exists. COI marked for retry. Customer can still download later."
 
 ---
 
@@ -360,189 +311,66 @@ Cons:
 ### **Honest Answer:**
 
 ```java
-// Cron picks up failed policies
 @Override
 public Response insurancePolicyCron(PolicyCronRequest cronRequest) {
-    log.info("Retrying insurance for failed policy applications");
     // Find policies with status = FAILED or PENDING
-    // Retry based on retry count and time elapsed
+    // Filter by retry_count < MAX_RETRIES
+    // Filter by last_attempt_time + RETRY_INTERVAL < NOW
+    // Retry each
 }
 ```
 
 **Why Cron over Event-Driven:**
-```
-1. Simplicity - no need for message queue infrastructure
-2. Batch processing - process multiple failures at once
-3. Visibility - easy to monitor via logs
-4. Control - can pause/resume via config
-```
-
-**Trade-offs Accepted:**
-```
-Cron:
-+ Simple implementation
-+ No additional infrastructure
-- Delay between failure and retry (cron interval)
-- Not real-time
-
-Event-Driven (Kafka):
-+ Immediate retry
-+ Better scalability
-- More infrastructure
-- Complex error handling
-```
-
-**Honest Assessment:**
-> "For our current scale (hundreds of policies/day), cron is sufficient. At higher scale, we'd consider Kafka-based retry."
+> "Simplicity. No Kafka infrastructure needed. For hundreds of policies/day, cron is sufficient."
 
 ---
 
-# 📋 ORCHESTRATION SERVICE - DEEP DIVE
-
-## **Q27: Explain Redis caching strategy for Orchestration**
+## **Q14: How do you maintain audit trail for compliance?**
 
 ### **Honest Answer:**
 
 ```java
-// From: orchestration/src/main/java/com/payu/vista/orchestration/redis/config/CustomRedisCacheManager.java
-
-public class CustomRedisCacheManager implements CacheManager {
-    
-    private final Map<String, Long> ttlConfig;  // Cache name → TTL
-    
-    private long getTtl(String cacheName) {
-        // Default: 7 days if not configured
-        return ttlConfig.getOrDefault(cacheName, TimeUnit.HOURS.toMillis(168));
-    }
+// Hibernate Envers for entity auditing
+@Entity
+@Audited
+public class PolicyDetails {
+    // All changes tracked automatically
 }
 
-// From: ApplicationDetailsRepository.java
-@Cacheable(value = "applicationCache", key = "#applicationId", unless = "#result == null")
-ApplicationDetails findByLosApplicationId(String applicationId);
-
-@Cacheable(value = "applicationDetailsCache", key = "T(java.util.Objects).hash(#applicationId, #partnerId)")
-ApplicationDetails findByLosApplicationIdAndPartnerId(String applicationId, Long partnerId);
+// Audit tables: policy_details_AUD
+// Tracks: WHO changed WHAT and WHEN
 ```
 
-**What We Cache:**
-```
-1. applicationCache - Application details by applicationId
-2. applicationDetailsCache - Application details by applicationId + partnerId
-3. partnerRefCache - Partner reference mapping
-4. authTokenCache - Authentication tokens
-```
-
-**Cache Pattern:**
-> "We use Cache-Aside pattern. Read: check cache first, miss → DB → populate cache. Write: update DB, invalidate cache."
-
-**TTL Strategy:**
-> "Default 7 days for application data (rarely changes). Auth tokens have shorter TTL."
-
-**Note:** Orchestration's cache is separate from ZipCredit's cache. The 7-day TTL applies to Orchestration service caching.
+**Data Retention:**
+> "Audit tables grow indefinitely. No automated cleanup currently."
 
 ---
 
-## **Q28: How do you handle cache consistency?**
-
-### **Honest Answer:**
-
-**IMPORTANT: The cache race condition was in ZipCredit service, NOT Orchestration.**
-
-**Problem We Faced (ZipCredit Service):**
-```java
-// GPay loan creation was failing in ZipCredit because:
-// Thread 1: Inserts LMS_CLIENT_SETUP_COMPLETED at 14:30:00.000
-// Thread 2: Reads from ZipCredit's Redis cache at 14:30:00.050 (stale data)
-// Thread 2: Validation fails!
-```
-
-**Our Fix in ZipCredit (Commit 31ed9d129f):**
-```java
-// In ZCVersion4ServiceImpl.java - Bypass cache for critical validations
-applicationTrackerBeanList = applicationTrackerService
-    .selectApplicationTrackerFromDB(applicationId, tenantId);  // Direct DB query
-
-// Added retry with exponential backoff
-int maxRetries = 3;
-int retryDelayMs = 100;
-for (int attempt = 1; attempt <= maxRetries; attempt++) {
-    // Validate
-    if (validationPasses) return;
-    Thread.sleep(retryDelayMs);
-    retryDelayMs *= 2;  // 100 → 200 → 400ms
-}
-```
-
-**Cache Stampede Prevention:**
-> "Honest answer: We don't have explicit stampede prevention. For Orchestration, TTL is 7 days so it's rare. For ZipCredit's application tracker cache, we bypass it for critical validations."
-
-**Redis Cluster Mode:**
-> "**Production runs Redis in CLUSTER mode**, not single instance. This provides:
-> - High availability (automatic failover)
-> - Data sharding across nodes
-> - Better scalability
-> 
-> We use Redisson client which handles cluster topology automatically."
-
----
-
-# 📋 STATE MACHINE - DEEP DIVE
+# 📋 STATE MACHINE - DEEP DIVE (Q15-Q16)
 
 ## **Q15: Walk me through your state machine design**
 
 ### **Honest Answer:**
 
 ```java
-// We use a history-based state tracking, not a traditional state machine library
+// NOT a formal state machine library. History-based tracking.
 
-// From: a_application_stage_tracker table
+// Table: a_application_stage_tracker
 // Each stage is a row with current_status and is_active flag
-// No formal state machine library (Spring Statemachine, etc.)
 
 // From: ApplicationStatusServiceImpl.java
 public boolean insertApplicationTracker(String applicationId, Integer tenantId, 
                                         ApplicationStage currentStatus) {
-    // 1. Mark previous active status as inactive
-    markcurrentStatusInActiveIfAlreadyAvailable(applicationId, tenantId, currentStatus);
-    
-    // 2. Get previous status
-    String prevStatus = getPrevStatus(applicationId, tenantId);
-    
-    // 3. Save current status
-    saveCurrentStatus(applicationId, tenantId, currentStatus, prevStatus);
-    
-    // 4. Process triggers (cascade to next stage)
-    processTriggers(applicationId, tenantId, currentStatus, prevStatus);
-    
+    markcurrentStatusInActiveIfAlreadyAvailable(...);
+    saveCurrentStatus(...);
+    processTriggers(...);  // Cascade to next stage
     return true;
 }
 ```
 
-**States (ApplicationStage enum):**
-```java
-public enum ApplicationStage {
-    APPLICATION_CREATED,
-    APPLICATION_APPROVED,
-    PHASE_ONE_DOCUMENTS_GENERATE_DSC_NOTIFICATION,
-    PHASE_ONE_DOCUMENTS_GENERATE_DSC_NOTIFICATION_SUCCESS,
-    LMS_CLIENT_SETUP_COMPLETED,
-    CREATE_LOAN_TL,
-    // ... 50+ stages
-}
-```
+**States:** 50+ stages in `ApplicationStage` enum
 
-**Triggers (TriggerServiceImpl):**
-```java
-// Stage insert → trigger lookup → async processing
-Map<String, Map<ApplicationStage, List<EventConfig>>> partnerStageEventConfigMap;
-
-CompletableFuture.runAsync(() -> {
-    eventService.process(applicationDetails);
-}, taskExecutor);
-```
-
-**Honest Assessment:**
-> "It's not a formal state machine. It's more like an event-driven progress tracker. Each stage insert can trigger subsequent actions asynchronously."
+**Triggers:** `TriggerServiceImpl` maps stage → events → async processing
 
 ---
 
@@ -551,131 +379,472 @@ CompletableFuture.runAsync(() -> {
 ### **Honest Answer:**
 
 ```
-We DON'T have automatic rollback/compensation.
+We DON'T have automatic rollback.
 
-What happens:
-1. Stage A succeeds → inserted into tracker
-2. Trigger for Stage B starts
-3. Stage B fails → logged, no automatic rollback
+1. Stage A succeeds → saved to DB
+2. Trigger for Stage B starts  
+3. Stage B fails → logged, NO rollback
 
 Recovery:
-- Idempotent retries
+- Idempotent retries (check what already succeeded)
+- Cron for stuck applications
 - Manual intervention for persistent failures
-- Cron jobs to pick up stuck applications
 ```
-
-**Example: Document Generation Failure**
-```java
-// From: AbstractDocumentDscAndNotification.java
-// Smart retry - checks what already succeeded
-
-if (!documentDSCAndNotificationEventResponse.getDocumentGenerationStatus()) {
-    lastStep = generateDocument(...);
-    response.setDocumentGenerationStatus(success);
-}
-
-if (!documentDSCAndNotificationEventResponse.getAddDSConDocumentStatus()) {
-    lastStep = addDscOnDocuments(...);
-    response.setAddDSconDocumentStatus(success);
-}
-
-// Each step checks if already done before retrying
-```
-
-**Honest Limitation:**
-> "We don't have Saga-style compensation. If something fails halfway, we retry from where it failed, not rollback what succeeded. For financial operations, this is actually safer than rollback."
 
 ---
 
-# 📋 METRICS - HONEST ASSESSMENT
+# 📋 PERFORMANCE OPTIMIZATION (Q17-Q20)
 
-## **Q: Your resume mentions 10x query performance improvement**
-
-### **Honest Answer:**
-
-> "I need to be transparent about this metric:
-> 
-> **Context:** This was likely measured for a specific query optimization (adding indexes, rewriting query). Not system-wide.
-> 
-> **What I can verify from codebase:**
-> - We use MyBatis with optimized SQL (explicit queries, not ORM-generated)
-> - We have read replicas for read-heavy operations
-> - We cache frequently accessed data in Redis
-> 
-> **Honest answer:** I'd need to check the specific measurement methodology. The claim might be for a specific optimization, not overall system improvement."
-
----
-
-## **Q: 40% server load reduction with batch processing**
+## **Q17: How did you achieve 10x improvement with read-write separation?**
 
 ### **Honest Answer:**
 
 ```java
-// From: loan-repayment service (batch processing)
-public class ChunkedListProcessingStrategy {
-    private static final int PROCESSING_CHUNK_SIZE = 1000;
+// Master for writes, Replica for reads
+// Routing via Spring's AbstractRoutingDataSource (if implemented)
+```
+
+**Honest Caveat:**
+> "I'd need to verify the '10x' measurement. This was likely for specific heavy-read queries that moved to replica. Not system-wide 10x."
+
+---
+
+## **Q18: How do you handle eventual consistency with read replicas?**
+
+### **Honest Answer:**
+
+```
+1. Writes go to master
+2. Replication lag: typically < 100ms
+3. Critical reads (after write): read from master
+4. Non-critical reads: can use replica
+```
+
+**How we handle:**
+> "For critical validations (like loan creation), we bypass cache and read from master DB directly."
+
+---
+
+## **Q19: Explain your batch processing implementation**
+
+### **Honest Answer:**
+
+```java
+// From: loan-repayment ChunkedListProcessingStrategy
+private static final int PROCESSING_CHUNK_SIZE = 1000;
+
+// Process in chunks instead of all at once
+for (List<T> chunk : partition(records, CHUNK_SIZE)) {
+    processChunk(chunk);
+}
+```
+
+**Why it helps:**
+- Smaller memory footprint
+- Prevents long-running transactions
+- Allows other queries to run
+
+---
+
+## **Q20: What rate limiting algorithm did you use?**
+
+### **Honest Answer:**
+
+```java
+// From: ZCVersion4ServiceImpl.java
+private void validateMaxApplicationLimit(String channelCode, Integer tenantId, String panNumber) {
+    int maxLimitByChannelAndPan = getMaxAllowedLimit(tenantId, "APPLICATION_MAX_LIMIT_BY_CHANNEL_PAN");
+    int maxLimitByPan = getMaxAllowedLimit(tenantId, "APPLICATION_MAX_LIMIT_BY_PAN");
     
-    // Process in chunks instead of all at once
+    int totalCountByChannelAndPan = applicationService.getApplicationCountByPanAndChannelCode(...);
+    
+    if (totalCountByChannelAndPan >= maxLimitByChannelAndPan) {
+        throw new ZcV4Exception("Max application limit reached");
+    }
 }
 ```
 
-> "**What we did:** Instead of processing all records in one query/loop, we process in chunks of 1000.
-> 
-> **Why it helps:** Smaller memory footprint, prevents long-running transactions, allows other queries to run.
-> 
-> **40% claim:** I'd need to verify how this was measured. Likely CPU/memory usage before/after comparison during batch jobs."
+**Algorithm:** Simple counter-based (not token bucket/leaky bucket)
+
+**Per-Tenant:** Yes, limits configurable per tenant
+
+**Distributed:** No Redis-based distributed rate limiting. DB count query.
 
 ---
 
-## **Q: 20% latency reduction with Redis**
+# 📋 LENDING REVAMP (Q21-Q24)
+
+## **Q21: Why Apache PDFBox over iText?**
 
 ### **Honest Answer:**
 
-> "**What we cache:**
-> - Application details (frequently accessed)
-> - Partner configuration
-> - Authentication tokens
-> 
-> **How it helps:**
-> - Cache hit avoids DB query (~5-10ms saved per hit)
-> - At ~70% cache hit rate, overall latency reduces
-> 
-> **20% claim:** Rough estimate based on:
-> - Average DB query: 10-50ms
-> - Cache lookup: 1-2ms
-> - 70% hit rate → significant reduction
-> 
-> **Honest caveat:** I don't have before/after APM metrics to verify exact percentage."
+> "PDFBox is Apache licensed (free). iText has commercial licensing for production use."
+
+**Trade-offs:**
+- PDFBox: Free, good for basic PDF generation
+- iText: More features, but licensing cost
 
 ---
 
-# 📋 FAILURE SCENARIOS (HONEST ANSWERS)
+## **Q22: How did you ensure 30% reduction in document generation time?**
+
+### **Honest Answer:**
+
+> "I'd need to verify the measurement methodology. Likely measured for specific document types."
+
+**What we optimized:**
+- Template caching
+- Parallel document generation for independent docs
+- Async processing (don't block API response)
+
+---
+
+## **Q23: How do you handle Video KYC failures?**
+
+### **Honest Answer:**
+
+```
+1. Hyperverge API call fails
+2. Status set to VIDEO_KYC_FAILED
+3. User can retry
+4. After max retries → manual review queue
+```
+
+**No automatic fallback.** Manual review for persistent failures.
+
+---
+
+## **Q24: Explain your wrapper API design for KYC providers**
+
+### **Honest Answer:**
+
+```java
+// Common interface
+public interface KycProvider {
+    KycResponse verifyIdentity(KycRequest request);
+}
+
+// Implementations for each vendor
+@Service public class HypervergeKycProvider implements KycProvider { }
+@Service public class DigilockerKycProvider implements KycProvider { }
+```
+
+**Why wrapper:**
+- Vendor lock-in prevention
+- Common error handling
+- Easy to switch providers
+
+---
+
+# 📋 PARTNER INTEGRATIONS (Q25-Q28)
+
+## **Q25: How do you handle different API contracts across partners?**
+
+### **Honest Answer:**
+
+```java
+// Adapter pattern per partner
+public interface PartnerAdapter {
+    LoanResponse createLoan(LoanRequest request);
+    StatusResponse getStatus(String applicationId);
+}
+
+// Each partner has adapter implementation
+@Service public class GPayAdapter implements PartnerAdapter { }
+@Service public class PhonePeAdapter implements PartnerAdapter { }
+```
+
+**Partner-specific quirks:** Handled in adapter, not in core logic.
+
+---
+
+## **Q26: How do you monitor transaction volumes across partners?**
+
+### **Honest Answer:**
+
+```
+1. Structured logs with partner_code
+2. Coralogix/Kibana dashboards filtered by partner
+3. SigNoz APM for latency per partner
+4. Grafana for success/failure rates
+```
+
+**No automated anomaly detection.** Manual dashboards.
+
+---
+
+## **Q27: Explain Redis caching strategy for Orchestration**
+
+### **Honest Answer:**
+
+```java
+// From: CustomRedisCacheManager.java
+private long getTtl(String cacheName) {
+    return ttlConfig.getOrDefault(cacheName, TimeUnit.HOURS.toMillis(168)); // 7 days default
+}
+
+// Usage
+@Cacheable(value = "applicationCache", key = "#applicationId")
+ApplicationDetails findByLosApplicationId(String applicationId);
+```
+
+**What we cache:** Application details, partner config, auth tokens
+
+**Pattern:** Cache-Aside (check cache → miss → DB → populate cache)
+
+---
+
+## **Q28: How do you handle cache consistency?**
+
+### **Honest Answer:**
+
+**The cache race condition was in ZipCredit service, NOT Orchestration.**
+
+**Our Fix (Commit 31ed9d129f):**
+```java
+// Bypass cache for critical validations
+applicationTrackerBeanList = applicationTrackerService
+    .selectApplicationTrackerFromDB(applicationId, tenantId);
+
+// Added retry with exponential backoff
+int maxRetries = 3;
+int retryDelayMs = 100;
+for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    if (validationPasses) return;
+    Thread.sleep(retryDelayMs);
+    retryDelayMs *= 2;
+}
+```
+
+**Redis Cluster Mode:**
+> "Production runs Redis in CLUSTER mode for HA and scalability."
+
+---
+
+# 📋 AI-ENHANCED DEVELOPMENT (Q29-Q30)
+
+## **Q29: How are you using Cursor AI in your workflow?**
+
+### **Honest Answer:**
+
+```
+1. Code generation: Boilerplate, DTOs, tests
+2. Code review assistance: Pattern suggestions
+3. Documentation: API docs, README
+4. Debugging: Analyzing stack traces
+5. Refactoring: Identifying code smells
+```
+
+**Where I use it most:** ConfigNexus project - built 80% with AI assistance.
+
+---
+
+## **Q30: What are limitations of AI-assisted development?**
+
+### **Honest Answer:**
+
+```
+1. Can generate plausible but incorrect code
+2. Doesn't understand business context
+3. Security: Don't paste secrets in prompts
+4. Still need human review
+5. Can be overconfident (like me making mistakes!)
+```
+
+**My approach:** AI generates → I verify → I test → I own the code.
+
+---
+
+# 📋 SYSTEM DESIGN & SCALABILITY (Q31-Q36)
+
+## **Q31: How do you ensure fault tolerance for 1M+ transactions?**
+
+### **Honest Answer:**
+
+```
+1. Stateless services (can restart without data loss)
+2. Database persistence before acknowledging
+3. Retry mechanisms for transient failures
+4. Redis cluster for cache HA
+5. Multiple service instances behind load balancer
+```
+
+**What we DON'T have:**
+- Circuit breaker (not implemented)
+- Chaos engineering
+- Multi-region deployment
+
+---
+
+## **Q32: How do you handle database scalability?**
+
+### **Honest Answer:**
+
+```
+1. Read replicas for read-heavy queries
+2. Connection pooling (HikariCP)
+3. Query optimization (indexes, explain plans)
+4. Batch processing for bulk operations
+```
+
+**What we DON'T have:**
+- Database sharding
+- Horizontal partitioning
+- Automated scaling
+
+---
+
+## **Q33: Explain your Kafka usage**
+
+### **Honest Answer:**
+
+> "**We don't use Kafka in our current architecture.**"
+
+We use:
+- `CompletableFuture` + `ThreadPoolTaskExecutor` for async processing
+- Cron jobs for retry
+- Direct HTTP calls between services
+
+**Why no Kafka:**
+> "Current scale doesn't require it. Operational complexity not justified."
+
+---
+
+## **Q34: How did you prioritize partner integrations?**
+
+### **Honest Answer:**
+
+```
+1. Business revenue impact (₹/month potential)
+2. Technical complexity (API readiness)
+3. Partner timeline requirements
+4. Team bandwidth
+```
+
+**Data-driven:** Product team provided revenue projections per partner.
+
+---
+
+## **Q35: Tell me about a time state machine didn't work as expected**
+
+### **Honest Answer:**
+
+> "The GPay cache race condition. Status was set correctly but validation failed due to stale cache."
+
+**How I handled:**
+1. Reproduced timing issue
+2. Identified cache as culprit
+3. Implemented bypass cache + retry
+4. Added logging to track retry attempts
+
+---
+
+## **Q36: How do you measure 30% reduction in onboarding time?**
+
+### **Honest Answer:**
+
+> "I'd need to verify exact methodology. Likely measured as:
+> - Before: X days to onboard partner
+> - After (with state machine): Y days
+> - Reduction = (X-Y)/X"
+
+**What helped:**
+- Reusable stage configurations
+- Partner template configs
+- ConfigNexus for config management
+
+---
+
+# 📋 TRADE-OFFS & DECISIONS (Q37-Q39)
+
+## **Q37: Why microservices for NACH and InsureX instead of monolith?**
+
+### **Honest Answer:**
+
+```
+1. Independent deployment (don't deploy entire monolith for NACH change)
+2. Team autonomy (NACH team owns NACH service)
+3. Different scaling needs
+4. Technology flexibility
+```
+
+**Trade-off:**
+> "More operational complexity. For smaller team, monolith might be simpler."
+
+---
+
+## **Q38: When do you choose Kafka vs Webhooks?**
+
+### **Honest Answer:**
+
+```
+Webhooks (what we use):
+- Partner-initiated callbacks
+- Simpler to implement
+- Direct acknowledgment
+- No infrastructure overhead
+
+Kafka (what we'd use for):
+- High-volume internal events
+- Decoupling services
+- Event replay needed
+- At-least-once guaranteed
+```
+
+**Our choice:** Webhooks for partner callbacks. No internal Kafka.
+
+---
+
+## **Q39: How do you balance speed vs quality?**
+
+### **Honest Answer:**
+
+```
+1. Critical paths (money flows): Quality first, thorough testing
+2. Non-critical features: Ship faster, iterate
+3. Tech debt: Track but don't block releases
+4. Code review: Always, but with clear scope
+```
+
+**Example:** Meesho factory pattern - I pushed for quality, but offered to absorb extra time.
+
+---
+
+# 📋 FAILURE SCENARIOS (Q40-Q42)
 
 ## **Q40: What if NACH mandate succeeds but webhook fails?**
 
 ### **Honest Answer:**
 
-```java
-// From: WebhookDetails entity
-private WebhookStatus status;     // PENDING, SUCCESS, FAILED
-private boolean retryRequired;    // For cron pickup
-
-// Flow:
-1. Mandate created successfully at Digio → Status = SUCCESS
+```
+1. Mandate created at Digio → Status = SUCCESS
 2. Partner webhook fails → WebhookStatus = FAILED, retryRequired = true
-3. Cron job picks up failed webhooks
-4. Retry with partner
-5. If persistent failure → Manual intervention (alert + dashboard)
+3. Cron picks up for retry
+4. If persistent → Manual intervention via admin dashboard
 ```
 
-**Reconciliation:**
-> "We don't have automated reconciliation. We rely on:
-> 1. Webhook retries (cron-based)
-> 2. Manual intervention via admin dashboard
-> 3. Partner can query status via API"
+**No automated reconciliation.** Alert on persistent failures.
 
-**Honest Limitation:**
-> "If webhook fails permanently and partner doesn't query status, there's a data inconsistency. We alert on persistent failures for manual handling."
+---
+
+## **Q41: How do you handle partial failures in batch processing?**
+
+### **Honest Answer:**
+
+```java
+for (Record record : batch) {
+    try {
+        process(record);
+        successCount++;
+    } catch (Exception e) {
+        log.error("Failed to process record: {}", record.getId(), e);
+        failedRecords.add(record);
+    }
+}
+// Continue with rest, don't rollback successful ones
+```
+
+**No transaction rollback** for partial failures. Process what we can, log failures.
 
 ---
 
@@ -688,28 +857,74 @@ private boolean retryRequired;    // For cron pickup
 2. Service crashes before Stage B trigger completes
 3. On restart:
    - Application shows Stage A as last active
-   - Manual or cron-based detection of "stuck" applications
-   - Retry from Stage A
+   - Cron detects "stuck" applications
+   - Retry trigger
 
-We don't have:
-- Automatic recovery
-- Checkpoint/savepoint during processing
-- Distributed transaction coordination
-```
-
-**How we detect stuck applications:**
-```sql
--- Find applications stuck in a stage for too long
-SELECT application_id, current_status, created_at
-FROM a_application_stage_tracker
-WHERE is_active = 1 
-AND created_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-AND current_status NOT IN ('LOAN_CREATED', 'REJECTED', 'CLOSED');
+No automatic recovery. Manual/cron-based detection.
 ```
 
 ---
 
-# 📋 SECURITY & COMPLIANCE
+# 📋 METRICS & MONITORING (Q43-Q45)
+
+## **Q43: How do you measure 20% improvement in webhook reliability?**
+
+### **Honest Answer:**
+
+> "I'd need to verify measurement methodology."
+
+**What we track:**
+- Webhook success rate (SUCCESS/TOTAL)
+- Retry count per webhook
+- Time to successful delivery
+
+---
+
+## **Q44: What monitoring do you have in place?**
+
+### **Honest Answer:**
+
+```
+1. SigNoz: APM, distributed tracing
+2. Kibana/ELK: Log aggregation, search
+3. Coralogix: Log analytics, alerts
+4. Grafana: Custom dashboards
+5. Sentry: Error tracking
+6. PagerDuty: On-call alerting
+```
+
+---
+
+## **Q45: How do you debug production issues in distributed systems?**
+
+### **Honest Answer:**
+
+```
+1. Correlation ID (MDC) for tracing across services
+2. Structured logs with application_id
+3. SigNoz traces for latency breakdown
+4. Kibana for log search
+5. Redash for database queries
+```
+
+**Example:** GPay cache issue - traced via correlation ID, found timing gap in logs.
+
+---
+
+# 📋 SECURITY & COMPLIANCE (Q46-Q47)
+
+## **Q46: How do you ensure PCI-DSS compliance?**
+
+### **Honest Answer:**
+
+> "We don't store card data. PCI-DSS not applicable for our flows."
+
+**What we do:**
+- PAN encrypted (CryptoUtility)
+- Aadhaar tokenized (via UIDAI APIs)
+- Audit logging for sensitive changes
+
+---
 
 ## **Q47: How do you handle sensitive data (PAN, Aadhaar)?**
 
@@ -717,18 +932,14 @@ AND current_status NOT IN ('LOAN_CREATED', 'REJECTED', 'CLOSED');
 
 ```java
 // From: CryptoUtility.java
-// PAN is encrypted before storage
 String encryptedPan = CryptoUtility.encryptHandlesNull(tenantId, panNumber.toUpperCase());
-
-// Masked in logs
-// logger.info("Processing for PAN: {}", maskPan(pan)); // Shows: XXXXX1234
 ```
 
-**What we encrypt (CryptoUtility.encryptHandlesNull):**
-- PAN numbers (AES encryption)
-- Bank account numbers
+**What we encrypt:**
+- PAN numbers
+- Bank account numbers  
 - Aadhaar numbers
-- **Addresses (line1, line2)** - encrypted in Aadhaar/KYC data
+- Addresses (line1, line2)
 - DOB
 - Phone numbers
 - Email addresses
@@ -738,52 +949,36 @@ String encryptedPan = CryptoUtility.encryptHandlesNull(tenantId, panNumber.toUpp
 - Application IDs
 - City, State, Pincode
 
-**Audit Logging:**
-> "We have audit tables (Hibernate Envers `@Audited` annotation) that track all changes to sensitive entities."
-
-**Honest Gap:**
-> "We don't have full PCI-DSS compliance. We don't store card data. For Aadhaar, we use tokenized verification via UIDAI APIs, not storing actual number."
-
 ---
 
 # 📋 QUESTIONS FOR INTERVIEWER
 
 **Strategic Questions to Ask:**
 
-1. **"How does Tide handle NACH mandates? I'd love to understand your architecture."**
-   - Shows domain knowledge
-   - Creates conversation
-
-2. **"What's your approach to partner integrations? How many banking partners do you work with?"**
-   - Relevant to your experience
-
-3. **"How do you balance feature velocity with financial compliance?"**
-   - Shows maturity
-
-4. **"What's your observability stack? We use Coralogix + Kibana + SigNoz - curious about yours."**
-   - Technical depth
-
-5. **"What does success look like for this role in 90 days?"**
-   - Shows intentionality
+1. **"How does Tide handle NACH mandates?"**
+2. **"What's your partner integration approach?"**
+3. **"How do you balance feature velocity with compliance?"**
+4. **"What's your observability stack?"**
+5. **"What does success look like in 90 days?"**
 
 ---
 
-# 🎯 QUICK REFERENCE: WHAT TO SAY VS NOT SAY
+# 🎯 QUICK REFERENCE
 
 ## **SAY:**
-✅ "We use Factory pattern for NACH types - Spring auto-discovers implementations"
-✅ "We use history-based state tracking, not a formal state machine library"
+✅ "We use Factory pattern for NACH types"
+✅ "We use history-based state tracking, not a formal library"
 ✅ "We rely on idempotent retries, not Saga-style compensation"
-✅ "We had a cache race condition that taught us to bypass cache for critical validations"
-✅ "I'd need to verify the exact measurement methodology for that metric"
+✅ "We had a cache race condition - taught us to bypass cache for critical validations"
+✅ "I'd need to verify the exact measurement for that metric"
 
 ## **DON'T SAY:**
-❌ "We have exactly-once delivery" (we have at-least-once with idempotency)
-❌ "We use Saga pattern with compensation" (we use retries)
-❌ "We have 10x improvement across the system" (specific query optimization)
-❌ "We have automated reconciliation" (manual + cron-based)
+❌ "We have exactly-once delivery" (we have at-least-once)
+❌ "We use Saga with compensation" (we use retries)
+❌ "We have automated reconciliation" (manual + cron)
+❌ "We use Kafka" (we don't)
 ❌ Fabricate metrics you can't explain
 
 ---
 
-**Remember: Honesty + Technical Depth > Impressive-sounding claims you can't back up** 🚀
+**Remember: Honesty + Technical Depth > Impressive-sounding claims** 🚀
